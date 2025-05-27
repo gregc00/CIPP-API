@@ -14,8 +14,7 @@ Function Invoke-ListIntunePolicy {
     Write-LogMessage -Headers $Headers -API $APINAME -message 'Accessed this API' -Sev 'Debug'
 
 
-    # Write to the Azure Functions log stream.
-    Write-Host 'PowerShell HTTP trigger function processed a request.'
+
 
     # Interact with query parameters or the body of the request.
     $TenantFilter = $Request.Query.TenantFilter
@@ -42,6 +41,16 @@ Function Invoke-ListIntunePolicy {
                     id     = 'WindowsFeatureUpdateProfiles'
                     method = 'GET'
                     url    = "/deviceManagement/windowsFeatureUpdateProfiles?`$expand=assignments&top=200"
+                }
+                @{
+                    id     = 'windowsQualityUpdatePolicies'
+                    method = 'GET'
+                    url    = "/deviceManagement/windowsQualityUpdatePolicies?`$expand=assignments&top=200"
+                }
+                @{
+                    id     = 'windowsQualityUpdateProfiles'
+                    method = 'GET'
+                    url    = "/deviceManagement/windowsQualityUpdateProfiles?`$expand=assignments&top=200"
                 }
                 @{
                     id     = 'GroupPolicyConfigurations'
@@ -78,6 +87,11 @@ Function Invoke-ListIntunePolicy {
                         '*microsoft.graph.macOSEndpointProtectionConfiguration*' { 'MacOS Endpoint Protection' }
                         '*microsoft.graph.androidWorkProfileGeneralDeviceConfiguration*' { 'Android Configuration' }
                         '*windowsFeatureUpdateProfiles*' { 'Feature Update' }
+                        '*windowsQualityUpdatePolicies*' { 'Quality Update' }
+                        '*windowsQualityUpdateProfiles*' { 'Quality Update' }
+                        '*iosUpdateConfiguration*' { 'iOS Update Configuration' }
+                        '*windowsDriverUpdateProfiles*' { 'Driver Update' }
+                        '*configurationPolicies*' { 'Device Configuration' }
                         default { $_.'assignments@odata.context' }
                     }
                     $Assignments = $_.assignments.target | Select-Object -Property '@odata.type', groupId

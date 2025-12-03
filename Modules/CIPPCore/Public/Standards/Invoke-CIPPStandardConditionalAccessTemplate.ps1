@@ -20,9 +20,12 @@ function Invoke-CIPPStandardConditionalAccessTemplate {
             High Impact
         ADDEDDATE
             2023-12-30
+        EXECUTIVETEXT
+            Deploys standardized conditional access policies that automatically enforce security requirements based on user location, device compliance, and risk factors. These templates ensure consistent security controls across the organization while enabling secure access to business resources.
         ADDEDCOMPONENT
             {"type":"autoComplete","name":"TemplateList","multiple":false,"label":"Select Conditional Access Template","api":{"url":"/api/ListCATemplates","labelField":"displayName","valueField":"GUID","queryKey":"ListCATemplates"}}
             {"name":"state","label":"What state should we deploy this template in?","type":"radio","options":[{"value":"donotchange","label":"Do not change state"},{"value":"Enabled","label":"Set to enabled"},{"value":"Disabled","label":"Set to disabled"},{"value":"enabledForReportingButNotEnforced","label":"Set to report only"}]}
+            {"type":"switch","name":"DisableSD","label":"Disable Security Defaults when deploying policy"}
         UPDATECOMMENTBLOCK
             Run the Tools\Update-StandardsComments.ps1 script to update this comment block
     .LINK
@@ -63,7 +66,19 @@ function Invoke-CIPPStandardConditionalAccessTemplate {
                         continue
                     }
                 }
-                $null = New-CIPPCAPolicy -replacePattern 'displayName' -TenantFilter $tenant -state $Setting.state -RawJSON $JSONObj -Overwrite $true -APIName $APIName -Headers $Request.Headers -DisableSD $Setting.DisableSD
+                $NewCAPolicy = @{
+                    replacePattern = 'displayName'
+                    TenantFilter   = $Tenant
+                    state          = $Setting.state
+                    RawJSON        = $JSONObj
+                    Overwrite      = $true
+                    APIName        = 'Standards'
+                    Headers        = $Request.Headers
+                    DisableSD      = $Setting.DisableSD
+                    CreateGroups   = $Setting.CreateGroups ?? $false
+                }
+
+                $null = New-CIPPCAPolicy @NewCAPolicy
             } catch {
                 $ErrorMessage = Get-NormalizedError -Message $_.Exception.Message
                 Write-LogMessage -API 'Standards' -tenant $tenant -message "Failed to create or update conditional access rule $($JSONObj.displayName). Error: $ErrorMessage" -sev 'Error'
@@ -73,6 +88,7 @@ function Invoke-CIPPStandardConditionalAccessTemplate {
     if ($Settings.report -eq $true -or $Settings.remediate -eq $true) {
         $Filter = "PartitionKey eq 'CATemplate'"
         $Policies = (Get-CippAzDataTableEntity @Table -Filter $Filter | Where-Object RowKey -In $Settings.TemplateList.value).JSON | ConvertFrom-Json -Depth 10
+        $AllCAPolicies = New-GraphGetRequest -Uri 'https://graph.microsoft.com/beta/identity/conditionalAccess/policies?$top=999' -tenantid $Tenant -asApp $true
         #check if all groups.displayName are in the existingGroups, if not $fieldvalue should contain all missing groups, else it should be true.
         $MissingPolicies = foreach ($Setting in $Settings.TemplateList) {
             $policy = $Policies | Where-Object { $_.displayName -eq $Setting.label }

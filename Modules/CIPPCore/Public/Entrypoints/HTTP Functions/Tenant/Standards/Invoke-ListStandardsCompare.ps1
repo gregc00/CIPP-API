@@ -1,5 +1,3 @@
-using namespace System.Net
-
 function Invoke-ListStandardsCompare {
     <#
     .FUNCTIONALITY
@@ -13,35 +11,19 @@ function Invoke-ListStandardsCompare {
 
     $Table = Get-CIPPTable -TableName 'CippStandardsReports'
     $TenantFilter = $Request.Query.tenantFilter
+    $TemplateFilter = $Request.Query.templateId
+
+    $Filters = [system.collections.generic.list[string]]::new()
     if ($TenantFilter) {
-        $Table.Filter = "PartitionKey eq '{0}'" -f $TenantFilter
+        $Filters.Add("PartitionKey eq '{0}'" -f $TenantFilter)
     }
+    if ($TemplateFilter) {
+        $Filters.Add("TemplateId eq '{0}'" -f $TemplateFilter)
+    }
+    $Filter = $Filters -join ' and '
 
     $Tenants = Get-Tenants -IncludeErrors
-    $Standards = Get-CIPPAzDataTableEntity @Table | Where-Object { $_.PartitionKey -in $Tenants.defaultDomainName }
-
-    #in the results we have objects starting with "standards." All these have to be converted from JSON. Do not do this is its a boolean
-    <#$Results | ForEach-Object {
-        $Object = $_
-        $Object.PSObject.Properties | ForEach-Object {
-            if ($_.Name -like 'standards_*') {
-                if ($_.Value -is [System.Boolean]) {
-                    $_.Value = [bool]$_.Value
-                } elseif ($_.Value -like '*{*') {
-                    $_.Value = ConvertFrom-Json -InputObject $_.Value -ErrorAction SilentlyContinue
-                } else {
-                    $_.Value = [string]$_.Value
-                }
-
-                $Key = $_.Name.replace('standards_', 'standards.')
-                $Key = $Key.replace('IntuneTemplate_', 'IntuneTemplate.')
-                $Key = $Key -replace '__', '-'
-
-                $object | Add-Member -MemberType NoteProperty -Name $Key -Value $_.Value -Force
-                $object.PSObject.Properties.Remove($_.Name)
-            }
-        }
-    }#>
+    $Standards = Get-CIPPAzDataTableEntity @Table -Filter $Filter | Where-Object { $_.PartitionKey -in $Tenants.defaultDomainName }
 
     $TenantStandards = @{}
     $Results = [System.Collections.Generic.List[object]]::new()
@@ -65,7 +47,7 @@ function Invoke-ListStandardsCompare {
 
         if ($FieldValue -is [System.Boolean]) {
             $FieldValue = [bool]$FieldValue
-        } elseif ($FieldValue -like '*{*') {
+        } elseif (Test-Json -Json $FieldValue -ErrorAction SilentlyContinue) {
             $FieldValue = ConvertFrom-Json -InputObject $FieldValue -ErrorAction SilentlyContinue
         } else {
             $FieldValue = [string]$FieldValue
@@ -77,6 +59,7 @@ function Invoke-ListStandardsCompare {
         $TenantStandards[$Tenant][$FieldName] = @{
             Value       = $FieldValue
             LastRefresh = $Standard.TimeStamp.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+            TemplateId  = $Standard.TemplateId
         }
     }
 
@@ -91,7 +74,7 @@ function Invoke-ListStandardsCompare {
         $Results.Add($TenantStandard)
     }
 
-    Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
+    return ([HttpResponseContext]@{
             StatusCode = [HttpStatusCode]::OK
             Body       = @($Results)
         })

@@ -1,6 +1,4 @@
-using namespace System.Net
-
-Function Invoke-ExecUpdateRefreshToken {
+function Invoke-ExecUpdateRefreshToken {
     <#
     .FUNCTIONALITY
         Entrypoint,AnyTenant
@@ -17,7 +15,7 @@ Function Invoke-ExecUpdateRefreshToken {
         # Handle refresh token update
         #make sure we get the latest authentication:
         $auth = Get-CIPPAuthentication
-        if ($env:AzureWebJobsStorage -eq 'UseDevelopmentStorage=true') {
+        if ($env:AzureWebJobsStorage -eq 'UseDevelopmentStorage=true' -or $env:NonLocalHostAzurite -eq 'true') {
             $DevSecretsTable = Get-CIPPTable -tablename 'DevSecrets'
             $Secret = Get-CIPPAzDataTableEntity @DevSecretsTable -Filter "PartitionKey eq 'Secret' and RowKey eq 'Secret'"
 
@@ -51,17 +49,21 @@ Function Invoke-ExecUpdateRefreshToken {
             $TenantName = $request.body.tenantId
         }
         $Results = @{
-            'message'  = "Successfully updated the credentials for $($TenantName). You may continue to the next step, or add additional tenants if required."
-            'severity' = 'success'
+            'resultText' = "Successfully updated the credentials for $($TenantName). You may continue to the next step, or add additional tenants if required."
+            'state'      = 'success'
         }
     } catch {
-        $Results = [pscustomobject]@{'Results' = "Failed. $($_.InvocationInfo.ScriptLineNumber): $($_.Exception.message)"; severity = 'failed' }
+        $Results = [pscustomobject]@{
+            'Results' = @{
+                resultText = "Failed. $($_.InvocationInfo.ScriptLineNumber): $($_.Exception.message)"
+                state      = 'failed'
+            }
+        }
+
+        return ([HttpResponseContext]@{
+                StatusCode = [HttpStatusCode]::OK
+                Body       = $Results
+            })
+
     }
-
-    # Associate values to output bindings by calling 'Push-OutputBinding'.
-    Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
-            StatusCode = [HttpStatusCode]::OK
-            Body       = $Results
-        })
-
 }

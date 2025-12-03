@@ -143,8 +143,8 @@ function Push-BECRun {
         Write-Information 'Getting bulk requests'
         $GraphResults = New-GraphBulkRequest -Requests $Requests -tenantid $TenantFilter -asapp $true
 
-        $PasswordChanges = ($GraphResults | Where-Object { $_.id -eq 'Users' }).body.value | Where-Object { $_.lastPasswordChangeDateTime -ge $startDate } ?? @()
-        $NewUsers = ($GraphResults | Where-Object { $_.id -eq 'Users' }).body.value | Where-Object { $_.createdDateTime -ge $startDate } ?? @()
+        $PasswordChanges = (($GraphResults | Where-Object { $_.id -eq 'Users' }).body.value | Where-Object { $_.lastPasswordChangeDateTime -ge $startDate }) ?? @()
+        $NewUsers = (($GraphResults | Where-Object { $_.id -eq 'Users' }).body.value | Where-Object { $_.createdDateTime -ge $startDate }) ?? @()
         $MFADevices = ($GraphResults | Where-Object { $_.id -eq 'MFADevices' }).body.value ?? @()
         $NewSPs = ($GraphResults | Where-Object { $_.id -eq 'NewSPs' }).body.value ?? @()
 
@@ -159,7 +159,7 @@ function Push-BECRun {
             NewUsers                 = @($NewUsers)
             MFADevices               = @($MFADevices)
             ChangedPasswords         = @($PasswordChanges)
-            ExtractedAt              = (Get-Date).ToString('s')
+            ExtractedAt              = (Get-Date)
             ExtractResult            = $ExtractResult
         }
 

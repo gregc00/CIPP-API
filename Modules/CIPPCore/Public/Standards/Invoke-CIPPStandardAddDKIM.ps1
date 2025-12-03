@@ -13,7 +13,9 @@ function Invoke-CIPPStandardAddDKIM {
         CAT
             Exchange Standards
         TAG
-            "CIS"
+            "CIS M365 5.0 (2.1.9)"
+        EXECUTIVETEXT
+            Enables email authentication technology that digitally signs outgoing emails to verify they actually came from your organization. This prevents email spoofing, improves email deliverability, and protects the company's reputation by ensuring recipients can trust emails from your domains.
         ADDEDCOMPONENT
         IMPACT
             Low Impact
@@ -74,6 +76,7 @@ function Invoke-CIPPStandardAddDKIM {
     # Same exclusions also found in Push-DomainAnalyserTenant
     $ExclusionDomains = @(
         '*.microsoftonline.com'
+        '*.mail.onmicrosoft.com'
         '*.exclaimer.cloud'
         '*.excl.cloud'
         '*.codetwo.online'
@@ -83,6 +86,7 @@ function Invoke-CIPPStandardAddDKIM {
         '*.teams.dstny.com'
         '*.msteams.8x8.com'
         '*.ucconnect.co.uk'
+        '*.teams-sbc.dk'
     )
 
     $AllDomains = ($BatchResults | Where-Object { $_.DomainName }).DomainName | ForEach-Object {

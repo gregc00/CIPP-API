@@ -13,6 +13,9 @@ function Invoke-CIPPStandardallowOTPTokens {
         CAT
             Entra (AAD) Standards
         TAG
+            "EIDSCA.AM02"
+        EXECUTIVETEXT
+            Enables one-time password generation through Microsoft Authenticator app, providing an additional secure authentication method for employees. This is particularly useful for secure VPN access and other systems requiring multi-factor authentication.
         ADDEDCOMPONENT
         IMPACT
             Low Impact
@@ -32,14 +35,13 @@ function Invoke-CIPPStandardallowOTPTokens {
 
     try {
         $CurrentInfo = New-GraphGetRequest -uri 'https://graph.microsoft.com/beta/policies/authenticationMethodsPolicy/authenticationMethodConfigurations/microsoftAuthenticator' -tenantid $Tenant
-    }
-    catch {
+    } catch {
         $ErrorMessage = Get-NormalizedError -Message $_.Exception.Message
         Write-LogMessage -API 'Standards' -Tenant $Tenant -Message "Could not get the allowOTPTokens state for $Tenant. Error: $ErrorMessage" -Sev Error
         return
     }
 
-    If ($Settings.remediate -eq $true) {
+    if ($Settings.remediate -eq $true) {
         if ($CurrentInfo.isSoftwareOathEnabled) {
             Write-LogMessage -API 'Standards' -tenant $tenant -message 'MS authenticator OTP/oAuth tokens is already enabled.' -sev Info
         } else {

@@ -13,6 +13,10 @@ function Invoke-CIPPStandardallowOAuthTokens {
         CAT
             Entra (AAD) Standards
         TAG
+            "EIDSCA.AT01"
+            "EIDSCA.AT02"
+        EXECUTIVETEXT
+            Allows employees to use third-party authentication apps and password managers to generate secure login codes, providing flexibility in authentication methods while maintaining security standards. This accommodates diverse user preferences and existing security tools.
         ADDEDCOMPONENT
         IMPACT
             Low Impact
@@ -32,15 +36,14 @@ function Invoke-CIPPStandardallowOAuthTokens {
 
     try {
         $CurrentState = New-GraphGetRequest -uri 'https://graph.microsoft.com/beta/policies/authenticationMethodsPolicy/authenticationMethodConfigurations/softwareOath' -tenantid $Tenant
-    }
-    catch {
+    } catch {
         $ErrorMessage = Get-NormalizedError -Message $_.Exception.Message
         Write-LogMessage -API 'Standards' -Tenant $Tenant -Message "Could not get the allowOTPTokens state for $Tenant. Error: $ErrorMessage" -Sev Error
         return
     }
     $StateIsCorrect = ($CurrentState.state -eq 'enabled')
 
-    If ($Settings.remediate -eq $true) {
+    if ($Settings.remediate -eq $true) {
         if ($StateIsCorrect -eq $true) {
             Write-LogMessage -API 'Standards' -tenant $tenant -message 'Software OTP/oAuth tokens is already enabled.' -sev Info
         } else {

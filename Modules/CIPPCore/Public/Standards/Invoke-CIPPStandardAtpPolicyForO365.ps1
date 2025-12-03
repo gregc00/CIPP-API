@@ -13,7 +13,8 @@ function Invoke-CIPPStandardAtpPolicyForO365 {
         CAT
             Defender Standards
         TAG
-            "CIS"
+            "CIS M365 5.0 (2.1.5)"
+            "NIST CSF 2.0 (DE.CM-09)"
         ADDEDCOMPONENT
             {"type":"switch","label":"Allow people to click through Protected View even if Safe Documents identified the file as malicious","name":"standards.AtpPolicyForO365.AllowSafeDocsOpen","defaultValue":false,"required":false}
         IMPACT
@@ -64,8 +65,8 @@ function Invoke-CIPPStandardAtpPolicyForO365 {
                 New-ExoRequest -tenantid $Tenant -cmdlet 'Set-AtpPolicyForO365' -cmdParams $cmdParams -UseSystemMailbox $true
                 Write-LogMessage -API 'Standards' -tenant $Tenant -message 'Updated Atp Policy For O365' -sev Info
             } catch {
-                $ErrorMessage = Get-NormalizedError -Message $_.Exception.Message
-                Write-LogMessage -API 'Standards' -tenant $Tenant -message "Failed to set Atp Policy For O365. Error: $ErrorMessage" -sev Error
+                $ErrorMessage = Get-CippException -Exception $_
+                Write-LogMessage -API 'Standards' -tenant $Tenant -message "Failed to set Atp Policy For O365. Error: $($ErrorMessage.NormalizedError)" -sev Error -LogData $ErrorMessage
             }
         }
     }

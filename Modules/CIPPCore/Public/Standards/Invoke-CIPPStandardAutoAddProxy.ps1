@@ -13,7 +13,8 @@ function Invoke-CIPPStandardAutoAddProxy {
         CAT
             Exchange Standards
         TAG
-            "CIS"
+        EXECUTIVETEXT
+            Automatically creates email addresses for employees across all company domains, ensuring they can receive emails sent to any of the organization's domain names. This improves email delivery reliability and maintains consistent communication channels across different business units or brands.
         ADDEDCOMPONENT
         IMPACT
             Medium Impact
@@ -38,10 +39,9 @@ function Invoke-CIPPStandardAutoAddProxy {
     try {
         $Domains = New-ExoRequest -TenantId $Tenant -Cmdlet 'Get-AcceptedDomain' | Select-Object -ExpandProperty DomainName
         $AllMailboxes = New-ExoRequest -TenantId $Tenant -Cmdlet 'Get-Mailbox'
-    }
-    catch {
-        $ErrorMessage = Get-NormalizedError -Message $_.Exception.Message
-        Write-LogMessage -API 'Standards' -Tenant $Tenant -Message "Could not get the AutoAddProxy state for $Tenant. Error: $ErrorMessage" -Sev Error
+    } catch {
+        $ErrorMessage = Get-CippException -Exception $_
+        Write-LogMessage -API 'Standards' -Tenant $Tenant -Message "Could not get the AutoAddProxy state for $Tenant. Error: $($ErrorMessage.NormalizedError)" -Sev Error -LogData $ErrorMessage
         return
     }
 

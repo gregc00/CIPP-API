@@ -13,6 +13,8 @@ function Invoke-CIPPStandardCloudMessageRecall {
         CAT
             Exchange Standards
         TAG
+        EXECUTIVETEXT
+            Enables employees to recall or retract emails they've sent, helping prevent embarrassing mistakes or accidental data sharing. This feature can reduce the impact of human errors in email communication and provides a safety net for sensitive information accidentally sent to wrong recipients.
         ADDEDCOMPONENT
             {"type":"autoComplete","multiple":false,"label":"Select value","name":"standards.CloudMessageRecall.state","options":[{"label":"Enabled","value":"true"},{"label":"Disabled","value":"false"}]}
         IMPACT
@@ -42,10 +44,9 @@ function Invoke-CIPPStandardCloudMessageRecall {
 
     try {
         $CurrentState = (New-ExoRequest -tenantid $Tenant -cmdlet 'Get-OrganizationConfig').MessageRecallEnabled
-    }
-    catch {
-        $ErrorMessage = Get-NormalizedError -Message $_.Exception.Message
-        Write-LogMessage -API 'Standards' -Tenant $Tenant -Message "Could not get the CloudMessageRecall state for $Tenant. Error: $ErrorMessage" -Sev Error
+    } catch {
+        $ErrorMessage = Get-CippException -Exception $_
+        Write-LogMessage -API 'Standards' -Tenant $Tenant -Message "Could not get the CloudMessageRecall state for $Tenant. Error: $($ErrorMessage.NormalizedError)" -Sev Error -LogData $ErrorMessage
         return
     }
     $WantedState = if ($state -eq 'true') { $true } else { $false }

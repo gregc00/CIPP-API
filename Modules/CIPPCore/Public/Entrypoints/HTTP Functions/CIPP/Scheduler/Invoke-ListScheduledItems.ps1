@@ -1,5 +1,3 @@
-using namespace System.Net
-
 function Invoke-ListScheduledItems {
     <#
     .FUNCTIONALITY
@@ -9,11 +7,6 @@ function Invoke-ListScheduledItems {
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
-
-    $APIName = $Request.Params.CIPPEndpoint
-    $Headers = $Request.Headers
-    Write-LogMessage -headers $Headers -API $APIName -message 'Accessed this API' -Sev 'Debug'
-
     $ScheduledItemFilter = [System.Collections.Generic.List[string]]::new()
     $ScheduledItemFilter.Add("PartitionKey eq 'ScheduledTask'")
 
@@ -26,6 +19,7 @@ function Invoke-ListScheduledItems {
         $ShowHidden = $Request.Query.ShowHidden ?? $Request.Body.ShowHidden
         $Name = $Request.Query.Name ?? $Request.Body.Name
         $Type = $Request.Query.Type ?? $Request.Body.Type
+        $SearchTitle = $Request.query.SearchTitle ?? $Request.body.SearchTitle
 
         if ($ShowHidden -eq $true) {
             $ScheduledItemFilter.Add('Hidden eq true')
@@ -51,6 +45,10 @@ function Invoke-ListScheduledItems {
     $Tasks = Get-CIPPAzDataTableEntity @Table -Filter $Filter
     if ($Type) {
         $Tasks = $Tasks | Where-Object { $_.command -eq $Type }
+    }
+
+    if ($SearchTitle) {
+        $Tasks = $Tasks | Where-Object { $_.Name -like $SearchTitle }
     }
 
     $AllowedTenants = Test-CIPPAccess -Request $Request -TenantList
@@ -108,12 +106,22 @@ function Invoke-ListScheduledItems {
                 type  = 'Tenant'
             }
         }
+        if ($Task.Trigger) {
+            try {
+                $TriggerObject = $Task.Trigger | ConvertFrom-Json -ErrorAction SilentlyContinue
+                if ($TriggerObject) {
+                    $Task | Add-Member -NotePropertyName Trigger -NotePropertyValue $TriggerObject -Force
+                }
+            } catch {
+                Write-Warning "Failed to parse trigger information for task $($Task.RowKey): $($_.Exception.Message)"
+                # Fall back to keeping original trigger value
+            }
+        }
 
         $Task
     }
 
-    # Associate values to output bindings by calling 'Push-OutputBinding'.
-    Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
+    return ([HttpResponseContext]@{
             StatusCode = [HttpStatusCode]::OK
             Body       = @($ScheduledTasks | Sort-Object -Property ScheduledTime, ExecutedTime -Descending)
         })

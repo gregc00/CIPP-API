@@ -52,20 +52,23 @@ function New-CIPPTemplateRun {
                 $ExistingTemplate = $ExistingTemplates | Where-Object { (![string]::IsNullOrEmpty($_.displayName) -and (Get-SanitizedFilename -filename $_.displayName) -eq (Get-SanitizedFilename -filename $File.name)) -or (![string]::IsNullOrEmpty($_.templateName) -and (Get-SanitizedFilename -filename $_.templateName) -eq (Get-SanitizedFilename -filename $File.name) ) -and ![string]::IsNullOrEmpty($_.SHA) } | Select-Object -First 1
 
                 $UpdateNeeded = $false
-                if ($ExistingTemplate -and $ExistingTemplate.SHA -ne $File.sha) {
+                if ($ExistingTemplate -and $ExistingTemplate.SHA -ne $File.sha -and $ExistingTemplate.Source -eq $TemplateSettings.templateRepo.value) {
                     $Name = $ExistingTemplate.displayName ?? $ExistingTemplate.templateName
                     Write-Information "Existing template $($Name) found, but SHA is different. Updating template."
                     $UpdateNeeded = $true
                     "Template $($Name) needs to be updated as the SHA is different"
-                } elseif ($ExistingTemplate -and $ExistingTemplate.SHA -eq $File.sha) {
+                } elseif ($ExistingTemplate -and $ExistingTemplate.SHA -eq $File.sha -and $ExistingTemplate.Source -eq $TemplateSettings.templateRepo.value) {
                     Write-Information "Existing template $($File.name) found, but SHA is the same. No update needed."
                     "Template $($File.name) found, but SHA is the same. No update needed."
                 }
 
                 if (!$ExistingTemplate -or $UpdateNeeded) {
                     $Template = (Get-GitHubFileContents -FullName $TemplateSettings.templateRepo.value -Branch $TemplateSettings.templateRepoBranch.value -Path $File.path).content | ConvertFrom-Json
-                    Import-CommunityTemplate -Template $Template -SHA $File.sha -MigrationTable $MigrationTable -LocationData $LocationData -Source $TemplateSettings.templateRepo.value
-                    if ($UpdateNeeded) {
+                    $ImportResult = Import-CommunityTemplate -Template $Template -SHA $File.sha -MigrationTable $MigrationTable -LocationData $LocationData -Source $TemplateSettings.templateRepo.value
+                    if ($ImportResult) {
+                        Write-Information $ImportResult
+                        $ImportResult
+                    } elseif ($UpdateNeeded) {
                         Write-Information "Template $($File.name) needs to be updated as the SHA is different"
                         "Template $($File.name) updated"
                     } else {
@@ -263,7 +266,7 @@ function New-CIPPTemplateRun {
                                 RAWJson     = $Template.TemplateJson
                                 Type        = $Template.Type
                                 GUID        = $ExistingPolicy.GUID
-                            } | ConvertTo-Json
+                            } | ConvertTo-Json -Compress
 
                             Add-CIPPAzDataTableEntity @Table -Entity @{
                                 JSON         = "$object"
@@ -283,7 +286,7 @@ function New-CIPPTemplateRun {
                                 RAWJson     = $Template.TemplateJson
                                 Type        = $Template.Type
                                 GUID        = $GUID
-                            } | ConvertTo-Json
+                            } | ConvertTo-Json -Compress
 
                             Add-CIPPAzDataTableEntity @Table -Entity @{
                                 JSON         = "$object"
@@ -317,7 +320,7 @@ function New-CIPPTemplateRun {
                                 RAWJson     = $Template.TemplateJson
                                 Type        = $Template.Type
                                 GUID        = $ExistingPolicy.GUID
-                            } | ConvertTo-Json
+                            } | ConvertTo-Json -Compress
 
                             Add-CIPPAzDataTableEntity @Table -Entity @{
                                 JSON         = "$object"
@@ -337,7 +340,7 @@ function New-CIPPTemplateRun {
                                 RAWJson     = $Template.TemplateJson
                                 Type        = $Template.Type
                                 GUID        = $GUID
-                            } | ConvertTo-Json
+                            } | ConvertTo-Json -Compress
 
                             Add-CIPPAzDataTableEntity @Table -Entity @{
                                 JSON         = "$object"

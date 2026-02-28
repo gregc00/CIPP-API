@@ -104,9 +104,10 @@ function Invoke-EditUser {
                         value = 'Set-CIPPUserLicense'
                     }
                     Parameters    = [pscustomobject]@{
-                        UserId      = $UserObj.id
-                        APIName     = 'Sherweb License Assignment'
-                        AddLicenses = $licenses
+                        UserId            = $UserObj.id
+                        APIName           = 'Sherweb License Assignment'
+                        AddLicenses       = $licenses
+                        UserPrincipalName = $UserPrincipalName
                     }
                     ScheduledTime = 0 #right now, which is in the next 15 minutes and should cover most cases.
                     PostExecution = @{
@@ -124,12 +125,12 @@ function Invoke-EditUser {
                     $Results.Add( 'Success. User license is already correct.' )
                 } else {
                     if ($UserObj.removeLicenses) {
-                        $licResults = Set-CIPPUserLicense -UserId $UserObj.id -TenantFilter $UserObj.tenantFilter -RemoveLicenses $CurrentLicenses.assignedLicenses.skuId -Headers $Headers -APIName $APIName
+                        $licResults = Set-CIPPUserLicense -UserPrincipalName $UserPrincipalName -UserId $UserObj.id -TenantFilter $UserObj.tenantFilter -RemoveLicenses $CurrentLicenses.assignedLicenses.skuId -Headers $Headers -APIName $APIName
                         $Results.Add($licResults)
                     } else {
                         #Remove all objects from $CurrentLicenses.assignedLicenses.skuId that are in $licenses
                         $RemoveLicenses = $CurrentLicenses.assignedLicenses.skuId | Where-Object { $_ -notin $licenses }
-                        $licResults = Set-CIPPUserLicense -UserId $UserObj.id -TenantFilter $UserObj.tenantFilter -RemoveLicenses $RemoveLicenses -AddLicenses $licenses -Headers $Headers -APIName $APIName
+                        $licResults = Set-CIPPUserLicense -UserPrincipalName $UserPrincipalName -UserId $UserObj.id -TenantFilter $UserObj.tenantFilter -RemoveLicenses $RemoveLicenses -AddLicenses $licenses -Headers $Headers -APIName $APIName
                         $Results.Add($licResults)
                     }
 
@@ -172,7 +173,7 @@ function Invoke-EditUser {
     if ($AddToGroups) {
         $AddToGroups | ForEach-Object {
 
-            $GroupType = $_.addedFields.calculatedGroupType
+            $GroupType = $_.addedFields.groupType
             $GroupID = $_.value
             $GroupName = $_.label
             Write-Host "About to add $($UserObj.userPrincipalName) to $GroupName. Group ID is: $GroupID and type is: $GroupType"
@@ -204,7 +205,7 @@ function Invoke-EditUser {
     if ($RemoveFromGroups) {
         $RemoveFromGroups | ForEach-Object {
 
-            $GroupType = $_.addedFields.calculatedGroupType
+            $GroupType = $_.addedFields.groupType
             $GroupID = $_.value
             $GroupName = $_.label
             Write-Host "About to remove $($UserObj.userPrincipalName) from $GroupName. Group ID is: $GroupID and type is: $GroupType"

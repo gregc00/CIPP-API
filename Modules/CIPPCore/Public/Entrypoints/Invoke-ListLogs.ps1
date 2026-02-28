@@ -21,7 +21,8 @@ function Invoke-ListLogs {
         }
     } elseif ($Request.Query.logentryid) {
         # Return single log entry by RowKey
-        $Filter = "RowKey eq '{0}'" -f $Request.Query.logentryid
+        $DateFilter = $Request.Query.DateFilter ?? (Get-Date -UFormat '%Y%m%d')
+        $Filter = "RowKey eq '{0}'" -f $Request.Query.logentryid, $DateFilter
         $AllowedTenants = Test-CIPPAccess -Request $Request -TenantList
         Write-Host "Getting single log entry for RowKey: $($Request.Query.logentryid)"
 
@@ -59,28 +60,29 @@ function Invoke-ListLogs {
                     $Row.LogData | ConvertFrom-Json
                 } else { $Row.LogData }
                 [PSCustomObject]@{
-                    DateTime = $Row.Timestamp
-                    Tenant   = $Row.Tenant
-                    API      = $Row.API
-                    Message  = $Row.Message
-                    User     = $Row.Username
-                    Severity = $Row.Severity
-                    LogData  = $LogData
-                    TenantID = if ($Row.TenantID -ne $null) {
+                    DateTime   = $Row.Timestamp
+                    Tenant     = $Row.Tenant
+                    API        = $Row.API
+                    Message    = $Row.Message
+                    User       = $Row.Username
+                    Severity   = $Row.Severity
+                    LogData    = $LogData
+                    TenantID   = if ($Row.TenantID -ne $null) {
                         $Row.TenantID
                     } else {
                         'None'
                     }
-                    AppId    = $Row.AppId
-                    IP       = $Row.IP
-                    RowKey   = $Row.RowKey
-                    Standard = $StandardInfo
+                    AppId      = $Row.AppId
+                    IP         = $Row.IP
+                    RowKey     = $Row.RowKey
+                    Standard   = $StandardInfo
+                    DateFilter = $Row.PartitionKey
                 }
             }
         }
     } else {
         if ($request.Query.Filter -eq 'True') {
-            $LogLevel = if ($Request.Query.Severity) { ($Request.query.Severity).split(',') } else { 'Info', 'Warn', 'Error', 'Critical', 'Alert' }
+            $LogLevel = if ($Request.Query.Severity) { ($Request.query.Severity).split(',') } else { 'Info', 'Warn', 'Warning', 'Error', 'Critical', 'Alert' }
             $PartitionKey = $Request.Query.DateFilter
             $username = $Request.Query.User ?? '*'
             $TenantFilter = $Request.Query.Tenant
@@ -92,19 +94,15 @@ function Invoke-ListLogs {
             $EndDate = $Request.Query.EndDate ?? $Request.Query.DateFilter
 
             if ($StartDate -and $EndDate) {
-                # Collect logs for each partition key date in range
-                $PartitionKeys = for ($Date = [datetime]::ParseExact($StartDate, 'yyyyMMdd', $null); $Date -le [datetime]::ParseExact($EndDate, 'yyyyMMdd', $null); $Date = $Date.AddDays(1)) {
-                    $PartitionKey = $Date.ToString('yyyyMMdd')
-                    "PartitionKey eq '$PartitionKey'"
-                }
-                $Filter = $PartitionKeys -join ' or '
+                # Collect logs for date range
+                $Filter = "PartitionKey ge '$StartDate' and PartitionKey le '$EndDate'"
             } elseif ($StartDate) {
                 $Filter = "PartitionKey eq '{0}'" -f $StartDate
             } else {
                 $Filter = "PartitionKey eq '{0}'" -f (Get-Date -UFormat '%Y%m%d')
             }
         } else {
-            $LogLevel = 'Info', 'Warn', 'Error', 'Critical', 'Alert'
+            $LogLevel = 'Info', 'Warn', 'Warning', 'Error', 'Critical', 'Alert'
             $PartitionKey = Get-Date -UFormat '%Y%m%d'
             $username = '*'
             $TenantFilter = $null
@@ -168,6 +166,7 @@ function Invoke-ListLogs {
                     IP           = $Row.IP
                     RowKey       = $Row.RowKey
                     StandardInfo = $StandardInfo
+                    DateFilter   = $Row.PartitionKey
                 }
             }
         }

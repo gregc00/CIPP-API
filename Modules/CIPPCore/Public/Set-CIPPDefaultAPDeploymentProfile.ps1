@@ -19,8 +19,21 @@ function Set-CIPPDefaultAPDeploymentProfile {
         $APIName = 'Add Default Autopilot Deployment Profile'
     )
 
+    # Checked before the try so the clean message is thrown as-is rather than wrapped by the catch below.
+    $NameCheck = Test-CIPPAutopilotProfileName -DisplayName $DisplayName
+    if (-not $NameCheck.IsValid) {
+        Write-LogMessage -Headers $Headers -API $APIName -tenant $TenantFilter -message $NameCheck.Message -Sev 'Error'
+        throw $NameCheck.Message
+    }
+
     try {
-        if ($Language -in @('user-select', 'os-default')) { $Language = "$null" }
+        # Map language selection to Graph API locale values:
+        # 'user-select' -> empty string (lets user choose during OOBE)
+        # 'os-default' or $null -> $null (uses operating system default)
+        # Specific tag (e.g. 'en-US') -> passed through as-is
+        if ($Language -eq 'os-default') {
+            $Language = $null
+        }
 
         # userType in outOfBoxExperienceSetting is only valid for user-driven (singleUser) mode.
         # The Intune API rejects it for self-deploying (shared) mode.
@@ -47,8 +60,8 @@ function Set-CIPPDefaultAPDeploymentProfile {
             'roleScopeTagIds'               = @()
             'outOfBoxExperienceSetting'     = $OutOfBoxSetting
         }
-        $Body = ConvertTo-Json -InputObject $ObjBody -Depth 10
 
+        $Body = ConvertTo-Json -InputObject $ObjBody -Depth 10
         Write-Information $Body
 
         $Profiles = New-GraphGETRequest -uri 'https://graph.microsoft.com/beta/deviceManagement/windowsAutopilotDeploymentProfiles' -tenantid $TenantFilter | Where-Object -Property displayName -EQ $DisplayName

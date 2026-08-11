@@ -4,6 +4,8 @@ function Invoke-ListTenants {
         Entrypoint,AnyTenant
     .ROLE
         CIPP.Core.Read
+    .DESCRIPTION
+        Lists all managed tenants accessible to the current user, with support for cache clearing and tenant filtering. This is the primary endpoint for tenant enumeration.
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
@@ -134,8 +136,33 @@ function Invoke-ListTenants {
                 $Body = $Tenants
             }
             if ($Request.Query.Mode -eq 'TenantList') {
+                # Index tenant group membership by customerId so each tenant can carry the
+                # groups it belongs to. Get-TenantGroups is cached and already scoped to the
+                # groups the calling user is allowed to see, so restricted users only get theirs.
+                $GroupsByCustomerId = @{}
+                try {
+                    foreach ($Group in @(Get-TenantGroups)) {
+                        foreach ($Member in @($Group.Members)) {
+                            if (!$Member.customerId) { continue }
+                            if (-not $GroupsByCustomerId.ContainsKey($Member.customerId)) {
+                                $GroupsByCustomerId[$Member.customerId] = [System.Collections.Generic.List[object]]::new()
+                            }
+                            $GroupsByCustomerId[$Member.customerId].Add([PSCustomObject]@{
+                                    Name      = $Group.Name
+                                    GroupType = $Group.GroupType
+                                })
+                        }
+                    }
+                } catch {
+                    Write-LogMessage -headers $Headers -API $APIName -message "Failed to retrieve tenant groups for the tenant list. The error is: $($_.Exception.Message)" -Sev 'Warning'
+                }
+
                 # add portal link properties
-                $Body = $Body | Select-Object *, @{Name = 'portal_m365'; Expression = { "https://admin.cloud.microsoft/?delegatedOrg=$($_.initialDomainName)" } },
+                # The unary comma on tenantGroups is required: Select-Object unrolls calculated
+                # property values, which would turn a single group into a bare object and no
+                # groups into $null instead of an empty array.
+                $Body = $Body | Select-Object *, @{Name = 'tenantGroups'; Expression = { , @($GroupsByCustomerId[$_.customerId] | Sort-Object -Property Name) } },
+                @{Name = 'portal_m365'; Expression = { "https://admin.cloud.microsoft/?delegatedOrg=$($_.initialDomainName)" } },
                 @{Name = 'portal_exchange'; Expression = { "https://admin.cloud.microsoft/exchange?delegatedOrg=$($_.initialDomainName)" } },
                 @{Name = 'portal_entra'; Expression = { "https://entra.microsoft.com/$($_.defaultDomainName)" } },
                 @{Name = 'portal_teams'; Expression = { "https://admin.teams.microsoft.com?delegatedOrg=$($_.initialDomainName)" } },
@@ -143,7 +170,14 @@ function Invoke-ListTenants {
                 @{Name = 'portal_intune'; Expression = { "https://intune.microsoft.com/$($_.defaultDomainName)" } },
                 @{Name = 'portal_security'; Expression = { "https://security.microsoft.com/?tid=$($_.customerId)" } },
                 @{Name = 'portal_compliance'; Expression = { "https://purview.microsoft.com/?tid=$($_.customerId)" } },
-                @{Name = 'portal_sharepoint'; Expression = { "/api/ListSharePointAdminUrl?tenantFilter=$($_.defaultDomainName)" } },
+                @{Name = 'portal_sharepoint'; Expression = {
+                        # Unlike the other portals, SharePoint's host name cannot be derived from the
+                        # tenant - it has to be resolved through Graph. Hand out the cached URL when we
+                        # have one so the link behaves like every other portal, and fall back to the
+                        # endpoint that resolves (and caches) it on first use.
+                        if ($_.SharepointAdminUrl) { $_.SharepointAdminUrl } else { "/api/ListSharePointAdminUrl?tenantFilter=$($_.defaultDomainName)" }
+                    }
+                },
                 @{Name = 'portal_platform'; Expression = { "https://admin.powerplatform.microsoft.com/account/login/$($_.customerId)" } },
                 @{Name = 'portal_bi'; Expression = { "https://app.powerbi.com/admin-portal?ctid=$($_.customerId)" } }
             }

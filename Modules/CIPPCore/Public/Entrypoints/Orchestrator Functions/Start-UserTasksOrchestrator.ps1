@@ -11,6 +11,8 @@ function Start-UserTasksOrchestrator {
         $TaskId = $null
     )
 
+    try { [CIPP.TestDataCache]::ClearExpired() } catch { Write-Information "TestDataCache clearexpired skipped: $($_.Exception.Message)" }
+
     $Table = Get-CippTable -tablename 'ScheduledTasks'
 
     if ($TaskId) {
@@ -26,10 +28,10 @@ function Start-UserTasksOrchestrator {
         }
     } else {
         $4HoursAgo = (Get-Date).AddHours(-4).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-        $24HoursAgo = (Get-Date).AddHours(-24).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-        # Pending = orchestrator queued, Running = actively executing
-        # Pick up: Planned, Failed-Planned, stuck Pending (>24hr), or stuck Running (>4hr for large AllTenants tasks)
-        $Filter = "PartitionKey eq 'ScheduledTask' and (TaskState eq 'Planned' or TaskState eq 'Failed - Planned' or (TaskState eq 'Pending' and Timestamp lt datetime'$24HoursAgo') or (TaskState eq 'Running' and Timestamp lt datetime'$4HoursAgo') or (TaskState eq 'Processing' and Timestamp lt datetime'$4HoursAgo'))"
+        $1HourAgo = (Get-Date).AddHours(-1).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+        # Pending = orchestrator claimed but executor not yet started, Running = actively executing
+        # Pick up: Planned, Failed-Planned, stuck Pending (>1hr - orphaned claim), or stuck Running/Processing (>4hr for large AllTenants tasks)
+        $Filter = "PartitionKey eq 'ScheduledTask' and (TaskState eq 'Planned' or TaskState eq 'Failed - Planned' or (TaskState eq 'Pending' and Timestamp lt datetime'$1HourAgo') or (TaskState eq 'Running' and Timestamp lt datetime'$4HoursAgo') or (TaskState eq 'Processing' and Timestamp lt datetime'$4HoursAgo'))"
         $tasks = Get-CIPPAzDataTableEntity @Table -Filter $Filter
     }
 
@@ -113,7 +115,14 @@ function Start-UserTasksOrchestrator {
                 }
 
                 if ($task.Tenant -eq 'AllTenants') {
-                    $ExcludedTenants = $task.excludedTenants -split ','
+                    $ExcludedTenants = @($task.excludedTenants -split ',' | Where-Object { $_ })
+                    if ($task.excludedTenantGroups) {
+                        # Expand excluded tenant groups at runtime so membership changes are honored
+                        $ExcludedGroups = $task.excludedTenantGroups | ConvertFrom-Json -ErrorAction SilentlyContinue
+                        if ($ExcludedGroups) {
+                            $ExcludedTenants = @($ExcludedTenants + (Expand-CIPPTenantGroups -TenantFilter $ExcludedGroups).value | Where-Object { $_ })
+                        }
+                    }
                     Write-Host "Excluded Tenants from this task: $ExcludedTenants"
                     $AllTenantCommands = foreach ($Tenant in $TenantList | Where-Object { $_.defaultDomainName -notin $ExcludedTenants }) {
                         $NewParams = $task.Parameters.Clone()
@@ -146,7 +155,14 @@ function Start-UserTasksOrchestrator {
                         # Expand the tenant group to individual tenants
                         $ExpandedTenants = Expand-CIPPTenantGroups -TenantFilter $TenantFilterForExpansion
 
-                        $ExcludedTenants = $task.excludedTenants -split ','
+                        $ExcludedTenants = @($task.excludedTenants -split ',' | Where-Object { $_ })
+                        if ($task.excludedTenantGroups) {
+                            # Expand excluded tenant groups at runtime so membership changes are honored
+                            $ExcludedGroups = $task.excludedTenantGroups | ConvertFrom-Json -ErrorAction SilentlyContinue
+                            if ($ExcludedGroups) {
+                                $ExcludedTenants = @($ExcludedTenants + (Expand-CIPPTenantGroups -TenantFilter $ExcludedGroups).value | Where-Object { $_ })
+                            }
+                        }
                         Write-Host "Excluded Tenants from this task: $ExcludedTenants"
 
                         $GroupTenantCommands = foreach ($ExpandedTenant in $ExpandedTenants | Where-Object { $_.value -notin $ExcludedTenants }) {

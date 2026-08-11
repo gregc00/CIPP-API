@@ -33,18 +33,18 @@ function Invoke-CIPPStandardPhishProtection {
         UPDATECOMMENTBLOCK
             Run the Tools\Update-StandardsComments.ps1 script to update this comment block
     .LINK
-        https://docs.cipp.app/user-documentation/tenant/standards/list-standards
+        https://docs.cipp.app/user-documentation/tenant/standards/alignment/templates/available-standards
     #>
 
     param($Tenant, $Settings)
 
-    $TestResult = Test-CIPPStandardLicense -StandardName 'PhishProtection' -TenantFilter $Tenant -RequiredCapabilities @('AAD_PREMIUM', 'AAD_PREMIUM_P2', 'OFFICE_BUSINESS')
+    $TestResult = Test-CIPPStandardLicense -StandardName 'PhishProtection' -TenantFilter $Tenant -Preset Entra -RequiredCapabilities @('OFFICE_BUSINESS')
 
     if ($TestResult -eq $false) {
         return $true
     } #we're done.
 
-    $TenantId = Get-Tenants | Where-Object -Property defaultDomainName -EQ $Tenant
+    $TenantId = Get-Tenants -TenantFilter $Tenant
 
     $Table = Get-CIPPTable -TableName Config
     $CippConfig = (Get-CIPPAzDataTableEntity @Table)
@@ -80,7 +80,8 @@ function Invoke-CIPPStandardPhishProtection {
                 try {
                     New-GraphPostRequest -tenantid $tenant -Uri "https://graph.microsoft.com/beta/organization/$($TenantId.customerId)/branding/localizations/" -ContentType 'application/json' -asApp $true -Type POST -Body $defaultBrandingBody -AddedHeaders $AddedHeaders
                 } catch {
-
+                    $ErrorMessage = Get-CippException -Exception $_
+                    Write-LogMessage -API 'Standards' -tenant $tenant -message "Failed to create default branding localization. Error: $($ErrorMessage.NormalizedError)" -sev Error -LogData $ErrorMessage
                 }
             }
             if ($currentBody -like "*$CSS*") {

@@ -59,6 +59,12 @@ function Get-CIPPSecureScoreReport {
             }
         }
 
+        # Drop partitions for tenants we no longer manage. The allTenants read is deliberately
+        # unfiltered and cached rows outlive an excluded tenant, so without this they keep showing
+        # up in the estate-wide view. Every other AllTenants report filters the same way.
+        $Rows = @($Rows | Where-Object { $TenantLookup.ContainsKey([string]$_.PartitionKey) })
+        if ($Rows.Count -eq 0) { return @() }
+
         # Only these three fields are ever materialized; controlScores and friends are skipped by the parser.
         $Projection = [string[]]@('currentScore', 'maxScore', 'createdDateTime')
 
@@ -97,7 +103,7 @@ function Get-CIPPSecureScoreReport {
                 TenantName      = $TenantInfo.displayName ?? $Key
                 CurrentScore    = [math]::Round($Current, 2)
                 MaxScore        = $Max
-                PercentageScore = if ($Max -gt 0) { [math]::Round(($Current / $Max) * 100, 1) } else { 0 }
+                PercentageScore = if ($Max -gt 0) { [math]::Round(($Current / $Max) * 100, 2) } else { 0 }
                 CapturedAt      = $Latest.createdDateTime
             }
 
@@ -109,7 +115,7 @@ function Get-CIPPSecureScoreReport {
                             Date            = $_.createdDateTime
                             CurrentScore    = [math]::Round([double]($_.currentScore ?? 0), 2)
                             PercentageScore = if ($PointMax -gt 0) {
-                                [math]::Round(([double]($_.currentScore ?? 0) / $PointMax) * 100, 1)
+                                [math]::Round(([double]($_.currentScore ?? 0) / $PointMax) * 100, 2)
                             } else { 0 }
                         }
                     }

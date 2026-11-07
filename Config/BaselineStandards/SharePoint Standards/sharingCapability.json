@@ -16,9 +16,7 @@
   "powershellEquivalent": "Update-MgBetaAdminSharePointSetting",
   "appliesToTest": [
     "CIS_7_2_3",
-    "CIS_7_2_4",
-    "ZTNA21803",
-    "ZTNA21804"
+    "CIS_7_2_4"
   ],
   "recommendedBy": [
     "CIS",
@@ -38,6 +36,8 @@
     "sharingCapability": {
       "type": "autoComplete",
       "label": "Select Sharing Level",
+      "required": true,
+      "recommended": 1,
       "options": [
         {
           "label": "Users can share only with people in the organization. No external sharing is allowed.",
@@ -64,6 +64,7 @@
   "read": {
     "cacheType": "SPOTenant"
   },
+  "writeTarget": "spoTenant",
   "remediate": {
     "executor": "SPOTenant",
     "properties": {

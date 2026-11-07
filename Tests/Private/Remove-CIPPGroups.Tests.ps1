@@ -27,6 +27,12 @@ BeforeAll {
     if (-not $ResolverPath) { throw 'Could not locate Resolve-CippExoBulkResult.ps1 under Modules/' }
     . $ResolverPath
 
+    # The resolver delegates error-text extraction to this pure helper; use the real one too.
+    $ErrorTextPath = Get-ChildItem -Path (Join-Path $RepoRoot 'Modules') -Recurse -Filter 'Get-CippExoErrorText.ps1' -File -ErrorAction SilentlyContinue |
+        Select-Object -First 1 -ExpandProperty FullName
+    if (-not $ErrorTextPath) { throw 'Could not locate Get-CippExoErrorText.ps1 under Modules/' }
+    . $ErrorTextPath
+
     . $FunctionPath
 
     function New-Group {
@@ -150,22 +156,25 @@ Describe 'Remove-CIPPGroups' {
             $Result | Should -Contain "Skipping removal of sseck@contoso.com from group 'SG-LIC-M365' because it has assigned licenses. This group will be handled during the license removal step."
         }
 
-        It 'reports a dynamic group as unremovable' {
+        It 'skips a dynamic group without reporting an error' {
             Set-Groups -Groups @(New-Group -Id 'group-dyn' -DisplayName 'Dynamic All' -MembershipRule 'user.department -eq "Sales"')
 
             $Result = Remove-CIPPGroups -Username 'sseck@contoso.com' -TenantFilter 'contoso.com'
 
             Should -Invoke New-GraphBulkRequest -Times 0 -Exactly -ParameterFilter { $Requests[0].method -eq 'DELETE' }
-            $Result | Should -Contain "Error: Could not remove sseck@contoso.com from group 'Dynamic All' because it is a Dynamic Group."
+            $Result | Should -Contain "Skipped removing sseck@contoso.com from group 'Dynamic All' because it is a Dynamic Group. Its membership rule will remove the user."
+            # Offboarding grades a step failed on any line starting Error/Failed.
+            @($Result | Where-Object { $_ -match '^\s*(Error|Failed)\b' }) | Should -BeNullOrEmpty
         }
 
-        It 'reports an AD-synced group as unremovable' {
+        It 'skips an AD-synced group without reporting an error' {
             Set-Groups -Groups @(New-Group -Id 'group-ad' -DisplayName 'Synced Group' -OnPremisesSyncEnabled $true)
 
             $Result = Remove-CIPPGroups -Username 'sseck@contoso.com' -TenantFilter 'contoso.com'
 
             Should -Invoke New-GraphBulkRequest -Times 0 -Exactly -ParameterFilter { $Requests[0].method -eq 'DELETE' }
-            $Result | Should -Contain "Error: Could not remove sseck@contoso.com from group 'Synced Group' because it is synced with Active Directory."
+            $Result | Should -Contain "Skipped removing sseck@contoso.com from group 'Synced Group' because it is synced with Active Directory. Remove the membership on-premises."
+            @($Result | Where-Object { $_ -match '^\s*(Error|Failed)\b' }) | Should -BeNullOrEmpty
         }
 
         It 'still removes the removable groups alongside the skipped ones' {
@@ -201,7 +210,7 @@ Describe 'Remove-CIPPGroups' {
 
             $Result = Remove-CIPPGroups -Username 'sseck@contoso.com' -TenantFilter 'contoso.com'
 
-            $Result | Should -Contain "Could not remove sseck@contoso.com from group 'All-Users': Insufficient privileges. This is likely because it's a Dynamic Group or synced with Active Directory"
+            $Result | Should -Contain "Failed to remove sseck@contoso.com from group 'All-Users': Insufficient privileges"
         }
 
         It 'reports an Exchange removal error against the group it belongs to' {
@@ -214,7 +223,7 @@ Describe 'Remove-CIPPGroups' {
 
             $Result = Remove-CIPPGroups -Username 'sseck@contoso.com' -TenantFilter 'contoso.com'
 
-            $Result | Should -Contain 'Could not remove sseck@contoso.com from All Office: The user is not a member of the group.'
+            $Result | Should -Contain 'Failed to remove sseck@contoso.com from All Office: The user is not a member of the group.'
         }
 
         It 'does not claim success for the other groups when one Exchange removal fails' {
@@ -236,7 +245,7 @@ Describe 'Remove-CIPPGroups' {
 
             $Result = Remove-CIPPGroups -Username 'sseck@contoso.com' -TenantFilter 'contoso.com'
 
-            $Result | Should -Contain 'Could not remove sseck@contoso.com from All Office: The user is not a member of the group.'
+            $Result | Should -Contain 'Failed to remove sseck@contoso.com from All Office: The user is not a member of the group.'
             $Result | Should -Contain 'Successfully removed sseck@contoso.com from group IEQ-Team'
         }
 

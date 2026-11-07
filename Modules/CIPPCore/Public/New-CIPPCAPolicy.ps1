@@ -45,11 +45,19 @@ function New-CIPPCAPolicy {
                     }
                 } elseif ($CreateGroups) {
                     Write-Warning "Creating group $_ as it does not exist in the tenant"
-                    if ($GroupTemplates.displayName -eq $_) {
+                    # A template store with duplicate display names returns every match here. Passing that
+                    # array to New-CIPPGroup makes the Graph create body's displayName an array, so the
+                    # create fails ("Unexpected token: StartArray. Path 'resourcePayload.displayName'") and
+                    # leaves an empty group id, which Graph then rejects with the opaque
+                    # "1054: Invalid group value: ." on the whole policy. Select a single template.
+                    $MatchingTemplates = @($GroupTemplates | Where-Object -Property displayName -EQ $_)
+                    if ($MatchingTemplates.Count -gt 0) {
+                        if ($MatchingTemplates.Count -gt 1) {
+                            Write-Warning "Multiple group templates found with display name '$_'. Using the first match."
+                            $null = Write-LogMessage -Headers $Headers -API $APIName -message "Multiple group templates found with display name '$_'. Using the first match; remove the duplicate group template." -Sev 'Warning'
+                        }
                         Write-Information "Creating group from template for $_"
-                        $GroupTemplate = $GroupTemplates | Where-Object -Property displayName -EQ $_
-                        $NewGroup = New-CIPPGroup -GroupObject $GroupTemplate -TenantFilter $TenantFilter -APIName $APIName
-                        $GroupIds.Add($NewGroup.GroupId)
+                        $NewGroup = New-CIPPGroup -GroupObject ($MatchingTemplates | Select-Object -First 1) -TenantFilter $TenantFilter -APIName $APIName
                     } else {
                         Write-Information "No template found, creating security group for $_"
                         $username = $_ -replace '[^a-zA-Z0-9]', ''
@@ -63,8 +71,14 @@ function New-CIPPCAPolicy {
                             securityEnabled = $true
                         }
                         $NewGroup = New-CIPPGroup -GroupObject $GroupObject -TenantFilter $TenantFilter -APIName $APIName
-                        $GroupIds.Add($NewGroup.GroupId)
                     }
+                    # Fail closed: never add an empty id. A dropped exclusion silently widens the policy
+                    # (e.g. break-glass accounts no longer excluded), and Graph rejects the empty value
+                    # anyway. Surface why the create failed instead of the opaque 1054 group error.
+                    if (-not $NewGroup.Success -or [string]::IsNullOrWhiteSpace($NewGroup.GroupId)) {
+                        throw "Failed to create group '$_' in tenant $TenantFilter$(if ($NewGroup.Error) { ": $($NewGroup.Error)" }). Resolve the group manually or remove the duplicate group template, then redeploy."
+                    }
+                    $GroupIds.Add($NewGroup.GroupId)
                 } else {
                     Write-Warning "Group $_ not found in the tenant and CreateGroups is disabled"
                     throw "Group '$_' not found in tenant $TenantFilter. Enable 'Create groups if they do not exist' or create the group manually before deploying this policy."
@@ -75,7 +89,7 @@ function New-CIPPCAPolicy {
     }
 
     function Convert-UserNameToId {
-        param($userNames)
+        param($userNames, [bool]$Strict)
 
         $UserIds = [System.Collections.Generic.List[string]]::new()
         $userNames | ForEach-Object {
@@ -90,6 +104,8 @@ function New-CIPPCAPolicy {
                         $null = Write-LogMessage -Headers $Headers -API $APIName -message "Replaced user name $_ with ID $uid" -Sev 'Debug'
                         $UserIds.Add($uid) # add the ID to the list
                     }
+                } elseif ($Strict) {
+                    throw "User '$_' not found in tenant $TenantFilter."
                 } else {
                     Write-Warning "User $_ not found in the tenant"
                     $null = Write-LogMessage -Headers $Headers -API $APIName -message "CA policy user value '$_' did not match any user in the tenant and was dropped from the policy" -Sev 'Warning'
@@ -99,10 +115,33 @@ function New-CIPPCAPolicy {
         return $UserIds
     }
 
+    # Custom variables must be resolved before the dependency lookups below. The only other
+    # substitution point is the Graph request layer (New-GraphPOSTRequest), which runs after the
+    # named-location / auth-strength / auth-context name matching - leaving those comparing raw
+    # %tokens% against real display names, so a location that exists is never matched: a duplicate
+    # is created on every deploy and the policy body keeps the token, which Graph then rejects
+    # (1040: NamedLocation with id <displayName> does not exist in the directory).
+    $RawJSON = Get-CIPPTextReplacement -TenantFilter $TenantFilter -Text $RawJSON -EscapeForJson
+
     $displayName = ($RawJSON | ConvertFrom-Json).displayName
 
     $JSONobj = $RawJSON | ConvertFrom-Json | Select-Object * -ExcludeProperty ID, GUID, *time*
-    Remove-EmptyArrays $JSONobj
+    $UnresolvedTokens = @(
+        foreach ($List in @($JSONobj.conditions.users, $JSONobj.conditions.locations, $JSONobj.conditions.applications)) {
+            if (-not $List) { continue }
+            foreach ($Property in $List.PSObject.Properties) {
+                foreach ($Value in @($Property.Value)) { if ($Value -is [string] -and $Value -match '^%[^%\s]+%$') { $Value } }
+            }
+        }
+    ) | Select-Object -Unique
+    if ($UnresolvedTokens) {
+        throw [System.ArgumentException]::new("Policy '$displayName' uses $($UnresolvedTokens -join ', '), which is not defined for $TenantFilter. Add it under Custom Variables, globally or for this tenant.")
+    }
+    # Canonicalize to full desired-state shape: an overwrite is a PATCH, and PATCH merges, so every
+    # managed key the template omits (stripped by older editors at save time) is added back as its
+    # cleared form - [] for assignments, null for condition blocks - or the tenant's deviations
+    # (extra excluded users, a different user set) survive every run and drift never converges.
+    Format-CIPPCAPolicy -Policy $JSONobj
     #Remove context as it does not belong in the payload.
     try {
         if ($JSONobj.grantControls) {
@@ -121,7 +160,8 @@ function New-CIPPCAPolicy {
                 $JSONobj.sessionControls.PSObject.Properties.Remove('disableResilienceDefaults')
             }
             if (@($JSONobj.sessionControls.PSObject.Properties).Count -eq 0) {
-                $JSONobj.PSObject.Properties.Remove('sessionControls')
+                # Null, not removed - a removed property leaves the tenant's session controls in place.
+                $JSONobj.sessionControls = $null
             }
         }
         if ($State -and $State -ne 'donotchange') {
@@ -372,6 +412,7 @@ function New-CIPPCAPolicy {
         if (!$locations) { continue }
         foreach ($location in $locations) {
             if (!$location.displayName) { continue }
+            Format-CIPPNamedLocationRange -Location $location
             # Use cached named locations instead of fetching each time
             $locationExistsInCache = $Location.displayName -in $AllNamedLocations.displayName
             if ($locationExistsInCache) {
@@ -474,10 +515,46 @@ function New-CIPPCAPolicy {
             }
         }
     }
+
+    # A name not defined in LocationInfo refers to a location the tenant already has.
+    $LocationSides = @('includeLocations', 'excludeLocations').Where({ @($JSONobj.conditions.locations.$_).Where({ $_ -and $_ -notin 'All', 'AllTrusted' -and -not (Test-IsGuid -String $_) }).Count -gt 0 })
+    if ($LocationSides.Count -gt 0) {
+        if ($null -eq $AllNamedLocations) {
+            $AllNamedLocations = if ($PreloadedLocations) { $PreloadedLocations } else {
+                try {
+                    New-GraphGETRequest -uri 'https://graph.microsoft.com/beta/identity/conditionalAccess/namedLocations?$top=999' -tenantid $TenantFilter -asApp $true
+                } catch {
+                    $ErrorMessage = Get-CippException -Exception $_
+                    throw "Failed to fetch named locations: $($ErrorMessage.NormalizedError)"
+                }
+            }
+        }
+        $TenantLocationIds = @{}
+        foreach ($TenantLocation in @($AllNamedLocations)) {
+            if ($TenantLocation.displayName -and -not $TenantLocationIds.ContainsKey($TenantLocation.displayName)) { $TenantLocationIds[$TenantLocation.displayName] = $TenantLocation.id }
+        }
+        foreach ($Side in $LocationSides) {
+            $JSONobj.conditions.locations.$Side = @(foreach ($Location in @($JSONobj.conditions.locations.$Side)) {
+                    if (-not $Location -or $Location -in 'All', 'AllTrusted' -or (Test-IsGuid -String $Location)) { $Location; continue }
+                    if (-not $TenantLocationIds.ContainsKey($Location)) {
+                        throw [System.Management.Automation.ItemNotFoundException]::new("Named location '$Location' used by policy '$displayName' was not found in $TenantFilter. Add it to the template's named locations or create it in the tenant first.")
+                    }
+                    $TenantLocationIds[$Location]
+                })
+        }
+    }
+
+    $ResolveNames = $false
     switch ($ReplacePattern) {
-        'none' {
+        { $_ -in 'none', 'leave' } {
+            # The deploy drawer sends 'leave'; treat it like 'none'.
             Write-Information 'Replacement pattern for inclusions and exclusions is none'
-            break
+            $NamedUsers = @(@($JSONobj.conditions.users.includeUsers) + @($JSONobj.conditions.users.excludeUsers)).Where({ $_ -and $_ -notin 'All', 'None', 'GuestsOrExternalUsers' -and -not (Test-IsGuid -String $_) })
+            $NamedGroups = @(@($JSONobj.conditions.users.includeGroups) + @($JSONobj.conditions.users.excludeGroups)).Where({ -not [string]::IsNullOrWhiteSpace($_) -and -not (Test-IsGuid -String $_) })
+            if ($NamedUsers.Count -eq 0 -and $NamedGroups.Count -eq 0) { break }
+            # Names (typically from a variable) still resolve, but nothing is created and nothing unmatched is dropped.
+            $ResolveNames = $true
+            $CreateGroups = $false
         }
         'AllUsers' {
             Write-Information 'Replacement pattern for inclusions and exclusions is All users. This policy will now apply to everyone.'
@@ -486,7 +563,7 @@ function New-CIPPCAPolicy {
             if ($JSONobj.conditions.users.includeGroups) { $JSONobj.conditions.users.includeGroups = @() }
             if ($JSONobj.conditions.users.excludeGroups) { $JSONobj.conditions.users.excludeGroups = @() }
         }
-        'displayName' {
+        { $_ -eq 'displayName' -or $ResolveNames } {
             $TemplatesTable = Get-CIPPTable -tablename 'templates'
             $GroupTemplates = Get-CIPPAzDataTableEntity @TemplatesTable -filter "PartitionKey eq 'GroupTemplate'" | ForEach-Object {
                 if ($_.JSON -and (Test-Json -Json $_.JSON -ErrorAction SilentlyContinue)) {
@@ -519,15 +596,17 @@ function New-CIPPCAPolicy {
                     $groups = ($BulkResults | Where-Object { $_.id -eq 'groups' }).body.value
                 }
 
+                # Cleared collections stay cleared - piping an empty into the converters resolves a
+                # phantom entry and logs a "did not match any user" warning for something nobody asked for.
                 foreach ($userType in 'includeUsers', 'excludeUsers') {
-                    if ($JSONobj.conditions.users.PSObject.Properties.Name -contains $userType -and $JSONobj.conditions.users.$userType -notin 'All', 'None', 'GuestsOrExternalUsers') {
-                        $JSONobj.conditions.users.$userType = @(Convert-UserNameToId -userNames $JSONobj.conditions.users.$userType)
+                    if (@($JSONobj.conditions.users.$userType).Count -gt 0 -and $JSONobj.conditions.users.$userType -notin 'All', 'None', 'GuestsOrExternalUsers') {
+                        $JSONobj.conditions.users.$userType = @(Convert-UserNameToId -userNames $JSONobj.conditions.users.$userType -Strict $ResolveNames)
                     }
                 }
 
                 # Check the included and excluded groups
                 foreach ($groupType in 'includeGroups', 'excludeGroups') {
-                    if ($JSONobj.conditions.users.PSObject.Properties.Name -contains $groupType) {
+                    if (@($JSONobj.conditions.users.$groupType).Count -gt 0) {
                         $JSONobj.conditions.users.$groupType = @(Convert-GroupNameToId -groupNames $JSONobj.conditions.users.$groupType -CreateGroups $CreateGroups -TenantFilter $TenantFilter -GroupTemplates $GroupTemplates)
                     }
                 }
@@ -541,26 +620,6 @@ function New-CIPPCAPolicy {
     }
     $JSONobj.PSObject.Properties.Remove('LocationInfo')
     $JSONobj.PSObject.Properties.Remove('AuthContextInfo')
-    foreach ($condition in $JSONobj.conditions.users.PSObject.Properties.Name) {
-        $value = $JSONobj.conditions.users.$condition
-        if ($null -eq $value) {
-            $JSONobj.conditions.users.$condition = @()
-            continue
-        }
-        if ($value -is [string]) {
-            if ([string]::IsNullOrWhiteSpace($value)) {
-                $JSONobj.conditions.users.$condition = @()
-                continue
-            }
-        }
-        if ($value -is [array]) {
-            $nonWhitespaceItems = $value | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-            if ($nonWhitespaceItems.Count -eq 0) {
-                $JSONobj.conditions.users.$condition = @()
-                continue
-            }
-        }
-    }
     if ($DisableSD -eq $true) {
         # Check if Security Defaults is already disabled using preloaded or live data
         $SDPolicy = $PreloadedSecurityDefaults

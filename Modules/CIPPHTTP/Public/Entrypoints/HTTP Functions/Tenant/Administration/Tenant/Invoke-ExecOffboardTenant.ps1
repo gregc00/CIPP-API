@@ -126,6 +126,23 @@ function Invoke-ExecOffboardTenant {
                 }
             }
 
+            if ($Request.Body.RemoveQuarantineAlert -eq $true) {
+                # Remove the protection alert created by the Quarantine Release Request Alert standard
+                try {
+                    $PolicyName = 'CIPP User requested to release a quarantined message'
+                    $QuarantineAlert = New-ExoRequest -tenantid $TenantFilter -cmdlet 'Get-ProtectionAlert' -Compliance | Where-Object { $_.Name -eq $PolicyName }
+                    if ($QuarantineAlert) {
+                        $null = New-ExoRequest -tenantid $TenantFilter -cmdlet 'Remove-ProtectionAlert' -Compliance -cmdParams @{ Identity = $PolicyName } -UseSystemMailbox $true
+                        $Results.Add('Successfully removed the CIPP Quarantine Release Request Alert')
+                        Write-LogMessage -headers $Headers -API $APIName -message 'CIPP Quarantine Release Request Alert was removed' -Sev 'Info' -tenant $TenantFilter
+                    } else {
+                        $Results.Add('No CIPP Quarantine Release Request Alert found to remove')
+                    }
+                } catch {
+                    $Errors.Add("Failed to remove the CIPP Quarantine Release Request Alert: $($_.Exception.message)")
+                }
+            }
+
             $VendorApps = $Request.Body.vendorApplications
             if ($VendorApps) {
                 $VendorApps | ForEach-Object {
@@ -216,13 +233,13 @@ function Invoke-ExecOffboardTenant {
         }
 
         Write-LogMessage -headers $Headers -API $APIName -message 'Offboarding completed' -Sev 'Info' -tenant $TenantFilter
-        $StatusCode = [HttpStatusCode]::OK
+        $StatusCode = if ($Tenant -and $TenantId -eq $env:TenantID) { [HttpStatusCode]::BadRequest } else { Get-CippBulkStatusCode -Total ($Results.Count + $Errors.Count) -Failed $Errors.Count }
         $body = [pscustomobject]@{
             'Results' = @($Results)
             'Errors'  = @($Errors)
         }
     } catch {
-        $StatusCode = [HttpStatusCode]::OK
+        $StatusCode = [HttpStatusCode]::InternalServerError
         $body = $_.Exception.message
     }
     return ([HttpResponseContext]@{

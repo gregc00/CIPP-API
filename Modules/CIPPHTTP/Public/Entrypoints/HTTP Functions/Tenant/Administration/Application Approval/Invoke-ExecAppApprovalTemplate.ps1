@@ -77,6 +77,7 @@ function Invoke-ExecAppApprovalTemplate {
                     'Results' = $_.Exception.Message
                 }
                 Write-LogMessage -headers $Headers -API $APIName -message "App Deployment Template Save failed: $($_.Exception.Message)" -Sev 'Error'
+                $StatusCode = [HttpStatusCode]::InternalServerError
             }
         }
         'Delete' {
@@ -84,7 +85,7 @@ function Invoke-ExecAppApprovalTemplate {
                 $TemplateId = $Request.Body.TemplateId
 
                 # Get the template to delete
-                $Template = Get-CIPPAzDataTableEntity @Table -Filter "PartitionKey eq 'AppApprovalTemplate' and RowKey eq '$TemplateId'"
+                $Template = Get-CIPPAzDataTableEntity @Table -Filter "PartitionKey eq 'AppApprovalTemplate' and RowKey eq '$(ConvertTo-CIPPODataFilterValue -Value $TemplateId)'"
 
                 if ($Template) {
                     $TemplateData = $Template.JSON | ConvertFrom-Json
@@ -101,12 +102,14 @@ function Invoke-ExecAppApprovalTemplate {
                     $Body = @{
                         'Results' = 'No template found with the provided ID'
                     }
+                    $StatusCode = [HttpStatusCode]::NotFound
                 }
             } catch {
                 $Body = @{
                     'Results' = "Failed to delete template: $($_.Exception.Message)"
                 }
                 Write-LogMessage -headers $Headers -API $APIName -message "App Deployment Template Delete failed: $($_.Exception.Message)" -Sev 'Error'
+                $StatusCode = [HttpStatusCode]::InternalServerError
             }
         }
         'Get' {
@@ -114,7 +117,7 @@ function Invoke-ExecAppApprovalTemplate {
             $filter = "PartitionKey eq 'AppApprovalTemplate'"
             if ($Request.Query.TemplateId) {
                 $templateId = $Request.Query.TemplateId
-                $filter = "PartitionKey eq 'AppApprovalTemplate' and RowKey eq '$templateId'"
+                $filter = "PartitionKey eq 'AppApprovalTemplate' and RowKey eq '$(ConvertTo-CIPPODataFilterValue -Value $templateId)'"
             }
 
             $Templates = Get-CIPPAzDataTableEntity @Table -Filter $filter
@@ -126,11 +129,12 @@ function Invoke-ExecAppApprovalTemplate {
                 # Create output object preserving original structure
                 $outputObject = $templateData | Select-Object -Property *
 
-                # Add the TemplateId (RowKey) to the output
-                $outputObject | Add-Member -NotePropertyName 'TemplateId' -NotePropertyValue $_.RowKey -Force
-
-                # Add timestamp from the table entity
-                $outputObject | Add-Member -NotePropertyName 'Timestamp' -NotePropertyValue $_.Timestamp.DateTime.ToString('yyyy-MM-ddTHH:mm:ssZ') -Force
+                $outputObject | Add-Member -NotePropertyMembers ([ordered]@{
+                        # Add the TemplateId (RowKey) to the output
+                        TemplateId = $_.RowKey
+                        # Add timestamp from the table entity
+                        Timestamp  = $_.Timestamp.DateTime.ToString('yyyy-MM-ddTHH:mm:ssZ')
+                    }) -Force
 
                 return $outputObject
             }
@@ -148,11 +152,12 @@ function Invoke-ExecAppApprovalTemplate {
                 # Create output object preserving original structure
                 $outputObject = $templateData | Select-Object -Property *
 
-                # Add the TemplateId (RowKey) to the output
-                $outputObject | Add-Member -NotePropertyName 'TemplateId' -NotePropertyValue $_.RowKey -Force
-
-                # Add timestamp from the table entity
-                $outputObject | Add-Member -NotePropertyName 'Timestamp' -NotePropertyValue $_.Timestamp.DateTime.ToString('yyyy-MM-ddTHH:mm:ssZ') -Force
+                $outputObject | Add-Member -NotePropertyMembers ([ordered]@{
+                        # Add the TemplateId (RowKey) to the output
+                        TemplateId = $_.RowKey
+                        # Add timestamp from the table entity
+                        Timestamp  = $_.Timestamp.DateTime.ToString('yyyy-MM-ddTHH:mm:ssZ')
+                    }) -Force
 
                 return $outputObject
             }

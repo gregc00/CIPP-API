@@ -26,11 +26,17 @@ function Invoke-ExecAddCippCveException {
             }
         }
 
+        if ($ApplyTo -eq 'Global' -and @(Test-CIPPAccess -Request $Request -TenantList) -notcontains 'AllTenants') {
+            return [HttpResponseContext]@{
+                StatusCode = [HttpStatusCode]::Forbidden
+                Body       = @{ Results = "You don't have access to all tenants, so you can't add an All Tenants (Global) exception. Choose All Affected Tenants to add it for the tenants you can access." }
+            }
+        }
+
         $CveExceptionsTable = Get-CIPPTable -TableName 'CveExceptions'
-        $CveCacheTable      = Get-CIPPTable -TableName 'CveCache'
 
         # Load all existing exceptions for this CVE
-        $AllCveExceptions = Get-CIPPAzDataTableEntity @CveExceptionsTable -Filter "PartitionKey eq '$CveId'"
+        $AllCveExceptions = Get-CIPPAzDataTableEntity @CveExceptionsTable -Filter "PartitionKey eq '$(ConvertTo-CIPPODataFilterValue -Value $CveId)'"
 
         $TenantsToUpdate = switch ($ApplyTo) {
             'CurrentTenant' {
@@ -40,9 +46,23 @@ function Invoke-ExecAddCippCveException {
                 @($TenantFilter)
             }
             'AllAffected' {
-                $RawCveData    = Get-CIPPDbItem -TenantFilter 'allTenants' -Type 'DefenderCVEs' | Where-Object { $_.RowKey -ne 'DefenderCVEs-Count' }
-                $AffectedEntries = $RawCveData.Data | ConvertFrom-Json | -Filter "PartitionKey eq '$CveId'"
-                @($AffectedEntries | Select-Object -ExpandProperty customerId -Unique)
+                # One cached row exists per (tenant x CVE) and the CVE id lives inside the
+                # Data JSON, so it cannot be filtered server-side. A substring probe skips
+                # the vast majority of rows without deserialising them (the writer stores
+                # Data with -Compress, so the pair carries no whitespace), and the parse
+                # confirms the match - the whole cache is never held parsed at once.
+                $AffectedTenants = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                $Needle = '"cveId":"{0}"' -f $CveId
+                $AffectedItems = foreach ($Row in Get-CIPPDbItem -TenantFilter 'allTenants' -Type 'DefenderCVEs') {
+                    if ($Row.RowKey -eq 'DefenderCVEs-Count' -or -not $Row.Data) { continue }
+                    if ($Row.Data.IndexOf($Needle, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
+                    $Item = $Row.Data | ConvertFrom-Json
+                    if ($Item.cveId -eq $CveId -and $Item.customerId) { $Item }
+                }
+                foreach ($Item in $AffectedItems | Select-CippAllowedTenantData -TenantProperty 'customerId') {
+                    [void]$AffectedTenants.Add([string]$Item.customerId)
+                }
+                @($AffectedTenants)
             }
             'Global' {
                 @('ALL')

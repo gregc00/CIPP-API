@@ -47,6 +47,7 @@ function Get-CIPPSchedulerBlockedCommands {
         # Extension authentication tokens
         'Get-GradientToken'
         'Get-HaloToken'
+        'Invoke-SyncroRequest'
         'Get-NinjaOneToken'
         'Get-SherwebAuthentication'
         'Get-HIBPAuth'
@@ -56,9 +57,13 @@ function Get-CIPPSchedulerBlockedCommands {
         'Set-CippKeyVaultSecret'
         'Remove-CippKeyVaultSecret'
         'Get-CIPPSAMCertificate'
+        'Get-CIPPSAMCertificateVersions'
         'New-CIPPSAMCertificate'
         'Set-CIPPSAMCertificate'
         'Update-CIPPSAMCertificate'
+        'ConvertTo-CIPPSAMCertificateInfo'
+        'Update-CIPPSAMSecret'
+        'Set-CIPPSAMCredentialRecord'
         'Get-ExtensionAPIKey'
         'Set-ExtensionAPIKey'
         'Remove-ExtensionAPIKey'
@@ -66,6 +71,7 @@ function Get-CIPPSchedulerBlockedCommands {
 
         # End-tenant secret material - recovery keys & admin passwords, PostExecution would exfiltrate them
         'Get-CIPPLAPSPassword'
+        'Get-CIPPMacOSLapsPassword'
         'Get-CIPPBitlockerKey'
         'Search-CIPPBitlockerKeys'
         'Get-CIPPFileVaultKey'

@@ -10,6 +10,7 @@ BeforeAll {
     function New-GraphPostRequest {
         param($tenantid, $Uri, $Type, $Body, $ContentType, $AsApp)
         $script:lastBody = $Body
+        $script:lastUri = $Uri
     }
     function Write-LogMessage { param($headers, $API, $tenant, $message, $sev, $LogData) }
     function Get-CippException { param($Exception) $Exception }
@@ -20,7 +21,36 @@ BeforeAll {
 Describe 'Set-CIPPAuthenticationPolicy' {
     BeforeEach {
         $script:lastBody = $null
+        $script:lastUri = $null
         $script:mockCurrentInfo = $null
+    }
+
+    It 'targets an external authentication method (GUID id) to the given groups' {
+        # External methods (Duo, Okta, ...) are keyed by configuration GUID, not a built-in name
+        $script:mockCurrentInfo = [pscustomobject]@{
+            '@odata.type' = '#microsoft.graph.externalAuthenticationMethodConfiguration'
+            id            = '68801234-aaaa-bbbb-cccc-1234567896ea'
+            displayName   = 'Cisco Duo'
+            state         = 'enabled'
+            appId         = '11111111-2222-3333-4444-555555555555'
+            includeTargets = @()
+        }
+
+        $Result = Set-CIPPAuthenticationPolicy -Tenant 'contoso.onmicrosoft.com' -AuthenticationMethodId '68801234-aaaa-bbbb-cccc-1234567896ea' `
+            -Enabled $true -GroupIds @('group-a', 'group-b')
+
+        $script:lastUri | Should -BeLike '*/authenticationMethodConfigurations/68801234-aaaa-bbbb-cccc-1234567896ea'
+        $body = $script:lastBody | ConvertFrom-Json
+        $body.state | Should -Be 'enabled'
+        $body.'@odata.type' | Should -Be '#microsoft.graph.externalAuthenticationMethodConfiguration'
+        @($body.includeTargets).id | Should -Be @('group-a', 'group-b')
+        $Result | Should -BeLike "*external method 'Cisco Duo'*"
+    }
+
+    It 'rejects an id that is neither a built-in method name nor a GUID' {
+        { Set-CIPPAuthenticationPolicy -Tenant 'contoso.onmicrosoft.com' -AuthenticationMethodId 'NotAMethod' -Enabled $true } |
+            Should -Throw -ExpectedMessage '*not a built-in authentication method name*'
+        $script:lastBody | Should -BeNullOrEmpty
     }
 
     It 'writes Temporary Access Pass sub-settings to the PATCH body' {
@@ -72,6 +102,47 @@ Describe 'Set-CIPPAuthenticationPolicy' {
         $body.isSelfServiceRegistrationAllowed | Should -Be $true
     }
 
+    It 'aligns FIDO2 attestation with the DEFAULT passkey profile when no parameter is passed' {
+        # Graph rejects a top-level attestation flag that disagrees with the default
+        # profile ("Attestation enforcement cannot be enabled when it is disabled in
+        # default passkey profile", proven live) - the enable must align, not force.
+        $script:mockCurrentInfo = [pscustomobject]@{
+            state                            = 'disabled'
+            isAttestationEnforced            = $false
+            isSelfServiceRegistrationAllowed = $true
+            defaultPasskeyProfile            = 'p-default'
+            passkeyProfiles                  = @(
+                [pscustomobject]@{ id = 'p-other'; attestationEnforcement = 'enforced'; keyRestrictions = [pscustomobject]@{ isEnforced = $false; enforcementType = 'allow'; aaGuids = @() } }
+                [pscustomobject]@{ id = 'p-default'; attestationEnforcement = 'disabled'; keyRestrictions = [pscustomobject]@{ isEnforced = $false; enforcementType = 'allow'; aaGuids = @() } }
+            )
+        }
+
+        Set-CIPPAuthenticationPolicy -Tenant 'contoso.onmicrosoft.com' -AuthenticationMethodId 'FIDO2' -Enabled $true
+
+        $body = $script:lastBody | ConvertFrom-Json
+        $body.state | Should -Be 'enabled'
+        $body.isAttestationEnforced | Should -Be $false
+    }
+
+    It 'gives FIDO2 passkey profiles missing keyRestrictions the neutral shape - Graph validates the whole config' {
+        $script:mockCurrentInfo = [pscustomobject]@{
+            state                            = 'disabled'
+            isAttestationEnforced            = $false
+            isSelfServiceRegistrationAllowed = $true
+            defaultPasskeyProfile            = 'p-1'
+            passkeyProfiles                  = @(
+                [pscustomobject]@{ id = 'p-1'; attestationEnforcement = 'enforced' }
+            )
+        }
+
+        Set-CIPPAuthenticationPolicy -Tenant 'contoso.onmicrosoft.com' -AuthenticationMethodId 'FIDO2' -Enabled $true
+
+        $body = $script:lastBody | ConvertFrom-Json
+        $body.isAttestationEnforced | Should -Be $true
+        @($body.passkeyProfiles)[0].keyRestrictions.enforcementType | Should -Be 'block'
+        @($body.passkeyProfiles)[0].keyRestrictions.isEnforced | Should -Be $false
+    }
+
     It 'scopes the method to all users when GroupIds contains all_users' {
         $script:mockCurrentInfo = [pscustomobject]@{
             state          = 'disabled'
@@ -112,6 +183,20 @@ Describe 'Set-CIPPAuthenticationPolicy' {
 
         $body = $script:lastBody | ConvertFrom-Json
         @($body.excludeTargets).Count | Should -Be 0
+    }
+
+    It 'writes exclude targets for methods other than Email' {
+        $script:mockCurrentInfo = [pscustomobject]@{
+            state          = 'disabled'
+            excludeTargets = @()
+        }
+
+        Set-CIPPAuthenticationPolicy -Tenant 'contoso.onmicrosoft.com' -AuthenticationMethodId 'softwareOath' `
+            -Enabled $true -ExcludeGroupIds @('admins')
+
+        $body = $script:lastBody | ConvertFrom-Json
+        $body.excludeTargets[0].id | Should -Be 'admins'
+        $body.excludeTargets[0].targetType | Should -Be 'group'
     }
 
     It 'writes the Voice isOfficePhoneAllowed setting to the PATCH body' {

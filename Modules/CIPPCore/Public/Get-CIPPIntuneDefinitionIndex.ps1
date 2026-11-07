@@ -33,9 +33,9 @@ function Get-CIPPIntuneDefinitionIndex {
     [CmdletBinding()]
     param()
 
-    # Interpolated rather than Join-Path deliberately - this is the path expression the collection
-    # has always been read with, and path handling differs between the dev and container hosts.
-    $Path = "$env:CIPPRootPath\Config\intuneCollection.json"
+    # Join-Path, not an interpolated backslash: Get-Item normalises '\' on Linux but
+    # [System.IO.File] does not, so the read below threw and the index never loaded there.
+    $Path = Join-Path $env:CIPPRootPath 'Config/intuneCollection.json'
 
     # An index we already hold is always better than none. If the collection cannot be read or
     # parsed right now, keep serving the cached one rather than degrading every comparison to raw
@@ -77,19 +77,27 @@ function Get-CIPPIntuneDefinitionIndex {
         # Definitions without options are the common case; leaving this $null keeps the projection
         # small and lets callers test it before attempting a lookup.
         $Options = $null
+        $RequiredChildIds = $null
         if ($Definition.options) {
             $Options = [System.Collections.Generic.Dictionary[string, string]]::new([System.StringComparer]::OrdinalIgnoreCase)
             foreach ($Option in $Definition.options) {
                 if ($null -eq $Option.id) { continue }
                 $Options["$($Option.id)"] = "$($Option.displayName)"
+                if ($Option.requiredChildIds) {
+                    $RequiredChildIds ??= [System.Collections.Generic.Dictionary[string, string[]]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                    $RequiredChildIds["$($Option.id)"] = [string[]]$Option.requiredChildIds
+                }
             }
         }
 
         # A definition with no display name stringifies to '', which is falsy - the call sites
         # already treat that as "no label" and fall back to the setting id.
         $Index[$Id] = @{
-            displayName = "$($Definition.displayName)"
-            options     = $Options
+            displayName      = "$($Definition.displayName)"
+            options          = $Options
+            requiredChildIds = $RequiredChildIds
+            minimumCount     = $Definition.minimumCount
+            maximumCount     = $Definition.maximumCount
         }
     }
 

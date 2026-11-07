@@ -17,7 +17,6 @@
   "appliesToTest": [
     "CIS_5_1_2_3",
     "SMB1001_2_8",
-    "ZTNA21772",
     "ZTNA21787"
   ],
   "recommendedBy": [
@@ -42,11 +41,16 @@
     "cacheType": "AuthorizationPolicy",
     "object": "defaultUserRolePermissions"
   },
+  "writeTarget": "authorizationPolicy",
+  "writeTargetProperties": {
+    "defaultUserRolePermissions.allowedToCreateTenants": "%allowTenantCreation%"
+  },
   "remediate": {
     "executor": "GraphRequest",
     "requests": [
       {
         "method": "PATCH",
+        "asApp": false,
         "uri": "policies/authorizationPolicy/authorizationPolicy",
         "body": {
           "defaultUserRolePermissions": {

@@ -17,7 +17,7 @@ function Start-CIPPOrchestrator {
         Indicates the caller is already running in a queue trigger context.
         Skips queuing and starts orchestration directly to avoid double-queuing.
     .EXAMPLE
-        Start-CIPPOrchestrator -InputObject @{OrchestratorName='BPA'; Batch=@($Tenants)}
+        Start-CIPPOrchestrator -InputObject @{OrchestratorName='UpdatePermissionsOrchestrator'; Batch=@($Tenants)}
     .EXAMPLE
         Start-CIPPOrchestrator -InputObject $InputObject -CallerIsQueueTrigger
     .FUNCTIONALITY
@@ -38,8 +38,12 @@ function Start-CIPPOrchestrator {
     if ($env:CIPPNG -eq 'true' -and $InputObject) {
         $OrchestratorName = $InputObject.OrchestratorName ?? 'UnnamedOrchestrator'
 
-        # QueueFunction pattern: call the function first to generate batch items
-        if (-not $InputObject.Batch -and $InputObject.QueueFunction) {
+        $AllowCollision = $InputObject.AllowCollision -ne $false
+        $CheckCollision = -not $AllowCollision -and [Craft.Services.OrchestratorBridge].GetMethod('IsRunActive')
+
+        # QueueFunction pattern: call the function first to generate batch items.
+        # Not while a no-collision run is active: the function may claim work (audit log windows) for a run that is then skipped.
+        if (-not $InputObject.Batch -and $InputObject.QueueFunction -and -not ($CheckCollision -and [Craft.Services.OrchestratorBridge]::IsRunActive($OrchestratorName))) {
             $QueueFuncName = "Push-$($InputObject.QueueFunction.FunctionName)"
             Write-Information "Craft: Calling QueueFunction '$QueueFuncName' to build batch for '$OrchestratorName'"
             $QueueItem = [PSCustomObject]$InputObject.QueueFunction
@@ -56,6 +60,14 @@ function Start-CIPPOrchestrator {
         $BatchQueueId = ($InputObject.Batch | Select-Object -First 1).QueueId
         if ($BatchQueueId) {
             $OrchestratorName = "$OrchestratorName-$BatchQueueId"
+        }
+
+        # AllowCollision = $false: skip while a run of this name (any queue id suffix) is still going.
+        if ($CheckCollision -and [Craft.Services.OrchestratorBridge]::IsRunActive($OrchestratorName)) {
+            $BatchTenants = @(@($InputObject.Batch.TenantFilter) + @($InputObject.QueueFunction.Parameters.TenantFilter) | Select-Object -Unique)
+            $LogTenant = if ($BatchTenants.Count -eq 1 -and $BatchTenants[0]) { $BatchTenants[0] } else { 'None' }
+            Write-LogMessage -API 'Orchestrator' -tenant $LogTenant -message "Skipped $OrchestratorName ($(@($InputObject.Batch).Where({ $null -ne $_ }).Count) tasks): a run with this name is still in progress" -sev Warning
+            return "Craft-$OrchestratorName-Skipped"
         }
 
         $PostExecFunctionName = $null
@@ -100,15 +112,111 @@ function Start-CIPPOrchestrator {
             throw
         }
 
-        Write-Information "Craft: Queuing orchestrator '$OrchestratorName' ($TaskCount tasks$(if ($PostExecFunctionName) { ", PostExec: $PostExecFunctionName" }))"
-        [Craft.Services.OrchestratorBridge]::QueueOrchestrationFromFile(
-            $OrchestratorName,
-            $BatchPath,
-            4,
-            $PostExecFunctionName,
-            $PostExecParametersJson,
-            $InputObject.Reference
-        )
+        # $CraftOperationContext is stamped into the global scope per invocation by the Craft
+        # worker — the pipeline thread never sees OperationContext.Current directly, and on an
+        # older Craft runtime the variable simply does not exist, so this read degrades to $null.
+        # Both the priority default and the parent-run lineage below come from it.
+        $OpContext = Get-Variable -Name 'CraftOperationContext' -Scope Global -ValueOnly -ErrorAction SilentlyContinue
+
+        # Bucket resolution lives in Resolve-CIPPOrchestratorPriority: explicit value, then the
+        # enclosing run's band, then P1 for HTTP-triggered work, else the background default P4.
+        $Priority = Resolve-CIPPOrchestratorPriority -InputObject $InputObject -OpContext $OpContext
+
+        # Lineage: pass the enclosing run explicitly as the new run's parent, so Craft holds the
+        # parent's finalize (and PostExecution) until this child completes. The bridge cannot see
+        # the parent on its own — its ambient context read is null on the pipeline thread, which
+        # is exactly where this call runs.
+        $ParentRunName = if ($null -ne $OpContext) {
+            # RunKey names the exact run when several runs share a name; older Craft only stamps RunName.
+            $OpContext.PSObject.Properties['RunKey'].Value ?? $OpContext.PSObject.Properties['RunName'].Value
+        }
+
+        # Sequential mode: opt-in per run (e.g. offboarding, where a later step must not race the ones
+        # before it). Craft runs the batch one task at a time in payload order instead of fanning out.
+        # Absent/false marshals to $false, so existing callers are unaffected.
+        $Sequential = [bool]($InputObject.Sequential)
+
+        # Neither is inherited from a parent run; only priority is.
+        $MaxConcurrency = [int]($InputObject.MaxConcurrency ?? 0)
+        $StopOnFailure = [bool]($InputObject.StopOnFailure)
+        if ($Sequential -and $MaxConcurrency -gt 0) {
+            Write-Warning "Craft: MaxConcurrency is ignored for '$OrchestratorName': a sequential run already runs one step at a time"
+        }
+        if ($StopOnFailure -and -not $Sequential) {
+            Write-Warning "Craft: StopOnFailure is ignored for '$OrchestratorName': it applies to sequential runs only"
+        }
+
+        Write-Information "Craft: Queuing orchestrator '$OrchestratorName' ($TaskCount tasks, P$Priority$(if ($Sequential) { ', Sequential' })$(if ($StopOnFailure) { ', StopOnFailure' })$(if ($MaxConcurrency -gt 0) { ", Max $MaxConcurrency" })$(if (-not $AllowCollision) { ', NoCollision' })$(if ($PostExecFunctionName) { ", PostExec: $PostExecFunctionName" })$(if ($ParentRunName) { ", Parent: $ParentRunName" }))"
+        # Match the deployed runtime's arity (11: MaxConcurrency/StopOnFailure, 9: AllowCollision, 8: Sequential,
+        # 7: ParentRunName, else 6); passing more arguments than it accepts fails the orchestration outright.
+        $QueueMethod = [Craft.Services.OrchestratorBridge].GetMethod('QueueOrchestrationFromFile')
+        $ParamCount = $QueueMethod.GetParameters().Count
+        if ($ParamCount -lt 11 -and ($MaxConcurrency -gt 0 -or $StopOnFailure)) {
+            Write-Warning "Craft: MaxConcurrency/StopOnFailure requested for '$OrchestratorName' but the deployed Craft runtime does not support them (ignored)"
+        }
+        if ($ParamCount -ge 11) {
+            [Craft.Services.OrchestratorBridge]::QueueOrchestrationFromFile(
+                $OrchestratorName,
+                $BatchPath,
+                $Priority,
+                $PostExecFunctionName,
+                $PostExecParametersJson,
+                $InputObject.Reference,
+                $ParentRunName,
+                $Sequential,
+                $AllowCollision,
+                $MaxConcurrency,
+                $StopOnFailure
+            )
+        } elseif ($ParamCount -ge 9) {
+            [Craft.Services.OrchestratorBridge]::QueueOrchestrationFromFile(
+                $OrchestratorName,
+                $BatchPath,
+                $Priority,
+                $PostExecFunctionName,
+                $PostExecParametersJson,
+                $InputObject.Reference,
+                $ParentRunName,
+                $Sequential,
+                $AllowCollision
+            )
+        } elseif ($ParamCount -ge 8) {
+            [Craft.Services.OrchestratorBridge]::QueueOrchestrationFromFile(
+                $OrchestratorName,
+                $BatchPath,
+                $Priority,
+                $PostExecFunctionName,
+                $PostExecParametersJson,
+                $InputObject.Reference,
+                $ParentRunName,
+                $Sequential
+            )
+        } elseif ($ParamCount -ge 7) {
+            if ($Sequential) {
+                Write-Warning "Craft: Sequential requested for '$OrchestratorName' but the deployed Craft runtime does not support it (running fan-out)"
+            }
+            [Craft.Services.OrchestratorBridge]::QueueOrchestrationFromFile(
+                $OrchestratorName,
+                $BatchPath,
+                $Priority,
+                $PostExecFunctionName,
+                $PostExecParametersJson,
+                $InputObject.Reference,
+                $ParentRunName
+            )
+        } else {
+            if ($Sequential) {
+                Write-Warning "Craft: Sequential requested for '$OrchestratorName' but the deployed Craft runtime does not support it (running fan-out)"
+            }
+            [Craft.Services.OrchestratorBridge]::QueueOrchestrationFromFile(
+                $OrchestratorName,
+                $BatchPath,
+                $Priority,
+                $PostExecFunctionName,
+                $PostExecParametersJson,
+                $InputObject.Reference
+            )
+        }
         return "Craft-$OrchestratorName"
     }
 

@@ -14,7 +14,7 @@ function Invoke-CIPPStandardDisableM365GroupUsers {
             Entra (AAD) Standards
         TAG
             "CISA (MS.AAD.21.1v1)"
-            "ZTNA21868"
+            "CIS_5_1_3_4"
         EXECUTIVETEXT
             Restricts the creation of Microsoft 365 groups, Teams, and SharePoint sites to authorized administrators, preventing uncontrolled proliferation of collaboration spaces. This ensures proper governance, naming conventions, and resource management while maintaining oversight of all collaborative environments. An approved group of designated users can optionally retain the ability to create groups.
         ADDEDCOMPONENT
@@ -114,13 +114,10 @@ function Invoke-CIPPStandardDisableM365GroupUsers {
                 }
 
                 if (!$CurrentState) {
-                    # The tenant has no Group.Unified directory setting yet, so create it with the
-                    # values we want already in place. Reading /beta/settings straight back after a
-                    # write returns nothing for ~10s (measured), so the old create-then-reread-then-
-                    # patch sequence left $CurrentState null and blew up on the assignment below.
-                    # New-GraphPostRequest hands back the created object, so no read-back is needed.
-                    # Prefer the live template so the payload stays complete if Microsoft revises
-                    # it; fall back to the values Microsoft shipped when this standard was written.
+                    # Create it with the values already in place. /beta/settings is eventually
+                    # consistent, so reading back after the write returned nothing and left
+                    # $CurrentState null; the POST response is used instead. The live template
+                    # keeps the payload complete if Microsoft revises it, with a built-in fallback.
                     try {
                         $Template = New-GraphGetRequest -Uri "https://graph.microsoft.com/beta/directorySettingTemplates/$GroupUnifiedTemplateId" -tenantid $Tenant
                         $TemplateValues = @($Template.values)
@@ -211,7 +208,6 @@ function Invoke-CIPPStandardDisableM365GroupUsers {
         }
 
         Set-CIPPStandardsCompareField -FieldName 'standards.DisableM365GroupUsers' -CurrentValue $CurrentValue -ExpectedValue $ExpectedValue -TenantFilter $Tenant
-        Add-CIPPBPAField -FieldName 'DisableM365GroupUsers' -FieldValue $StateIsCorrect -StoreAs bool -Tenant $tenant
     }
 
 }

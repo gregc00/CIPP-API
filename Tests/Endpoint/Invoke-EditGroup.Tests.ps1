@@ -33,6 +33,7 @@ BeforeAll {
     function Get-NormalizedError { param($message) $message }
     function Get-CippException { param($Exception) @{ NormalizedError = "$Exception" } }
     function Set-CIPPGroupLicense { param($GroupId, $TenantFilter, $AddLicenses, $RemoveLicenses, $Headers, $APIName) }
+    function Resolve-CIPPDirectoryId { param($Identity, $TenantFilter) }
 
     # Real helper, not a stub: matching Exchange bulk results back to operations is exactly what
     # the reporting assertions below are checking.
@@ -40,6 +41,18 @@ BeforeAll {
         Select-Object -First 1 -ExpandProperty FullName
     if (-not $ResolverPath) { throw 'Could not locate Resolve-CippExoBulkResult.ps1 under Modules/' }
     . $ResolverPath
+
+    # The resolver delegates error-text extraction to this pure helper; use the real one too.
+    $ErrorTextPath = Get-ChildItem -Path (Join-Path $RepoRoot 'Modules') -Recurse -Filter 'Get-CippExoErrorText.ps1' -File -ErrorAction SilentlyContinue |
+        Select-Object -First 1 -ExpandProperty FullName
+    if (-not $ErrorTextPath) { throw 'Could not locate Get-CippExoErrorText.ps1 under Modules/' }
+    . $ErrorTextPath
+
+    # Real helper: Send As on a group reuses the mailbox permission cmdlet builder.
+    $MailboxPermissionPath = Get-ChildItem -Path (Join-Path $RepoRoot 'Modules') -Recurse -Filter 'Set-CIPPMailboxPermission.ps1' -File -ErrorAction SilentlyContinue |
+        Select-Object -First 1 -ExpandProperty FullName
+    if (-not $MailboxPermissionPath) { throw 'Could not locate Set-CIPPMailboxPermission.ps1 under Modules/' }
+    . $MailboxPermissionPath
 
     . $FunctionPath
 
@@ -76,6 +89,24 @@ BeforeAll {
             addedFields = [pscustomobject]@{ userPrincipalName = $Upn }
         }
     }
+
+    # Stable id map for ManagedBy rewrite tests (EXO may return UPN or GUID; writes must be ids).
+    function New-ResolvedOwner {
+        param([string]$InputIdentity, [string]$Id, [string]$Upn)
+        [pscustomobject]@{
+            Input             = $InputIdentity
+            Id                = $Id
+            UserPrincipalName = $Upn
+            DisplayName       = $null
+            Mail              = $null
+            MailNickname      = $null
+            ODataType         = '#microsoft.graph.user'
+            Type              = 'User'
+            ExchangeIdentity  = $Upn ?? $Id
+            Label             = $Upn ?? $Id
+            Resolved          = $true
+        }
+    }
 }
 
 Describe 'Invoke-EditGroup - membership' {
@@ -86,6 +117,26 @@ Describe 'Invoke-EditGroup - membership' {
         Mock -CommandName New-ExoBulkRequest -MockWith { @() }
         Mock -CommandName New-ExoRequest -MockWith { @() }
         Mock -CommandName Set-CIPPGroupLicense -MockWith { }
+        Mock -CommandName Resolve-CIPPDirectoryId -MockWith {
+            param($Identity, $TenantFilter)
+            $Map = @{
+                'existing@contoso.com' = 'existing-guid'
+                'boss@contoso.com'     = 'boss-guid'
+                'keep@contoso.com'     = 'keep-guid'
+                'drop@contoso.com'     = 'drop-guid'
+                'existing-guid'        = 'existing-guid'
+                'boss-guid'            = 'boss-guid'
+                'keep-guid'            = 'keep-guid'
+                'drop-guid'            = 'drop-guid'
+            }
+            foreach ($raw in @($Identity)) {
+                $id = $Map[$raw] ?? $raw
+                $upn = if ($raw -match '@') { $raw } else {
+                    ($Map.GetEnumerator() | Where-Object { $_.Value -eq $id -and $_.Key -match '@' } | Select-Object -First 1).Key
+                }
+                New-ResolvedOwner -InputIdentity $raw -Id $id -Upn $upn
+            }
+        }
     }
 
     Context 'Adding members' {
@@ -290,7 +341,7 @@ Describe 'Invoke-EditGroup - membership' {
         }
 
         It 'rewrites ManagedBy wholesale when adding an owner to a distribution list' {
-            # Exchange has no owners collection to append to.
+            # Exchange has no owners collection to append to. ManagedBy is rewritten with Graph ids.
             Mock -CommandName New-ExoRequest -MockWith { [pscustomobject]@{ ManagedBy = @('existing@contoso.com') } }
             $Request = New-GroupRequest -GroupType 'Distribution List' -Body @{
                 AddOwner = @(New-Member -Upn 'boss@contoso.com' -Value 'boss@contoso.com')
@@ -301,8 +352,8 @@ Describe 'Invoke-EditGroup - membership' {
             Should -Invoke New-ExoBulkRequest -Times 1 -Exactly -ParameterFilter {
                 $Set = $cmdletArray | Where-Object { $_.CmdletInput.CmdletName -eq 'Set-DistributionGroup' }
                 $Set -and
-                $Set.CmdletInput.Parameters.ManagedBy -contains 'existing@contoso.com' -and
-                $Set.CmdletInput.Parameters.ManagedBy -contains 'boss@contoso.com'
+                $Set.CmdletInput.Parameters.ManagedBy -contains 'existing-guid' -and
+                $Set.CmdletInput.Parameters.ManagedBy -contains 'boss-guid'
             }
         }
 
@@ -334,7 +385,8 @@ Describe 'Invoke-EditGroup - membership' {
             Should -Invoke New-ExoBulkRequest -Times 1 -Exactly -ParameterFilter {
                 $Set = $cmdletArray | Where-Object { $_.CmdletInput.CmdletName -eq 'Set-DistributionGroup' }
                 $Set -and
-                $Set.CmdletInput.Parameters.ManagedBy -contains 'keep@contoso.com' -and
+                $Set.CmdletInput.Parameters.ManagedBy -contains 'keep-guid' -and
+                $Set.CmdletInput.Parameters.ManagedBy -notcontains 'drop-guid' -and
                 $Set.CmdletInput.Parameters.ManagedBy -notcontains 'drop@contoso.com'
             }
         }
@@ -488,5 +540,121 @@ Describe 'Invoke-EditGroup - membership' {
 
             Should -Invoke New-ExoBulkRequest -Times 1 -Exactly
         }
+    }
+}
+
+Describe 'Invoke-EditGroup - send permissions' {
+    BeforeEach {
+        Mock -CommandName Write-LogMessage -MockWith { }
+        Mock -CommandName New-GraphGetRequest -MockWith { [pscustomobject]@{ id = 'group-guid'; displayName = 'All Office' } }
+        Mock -CommandName New-GraphBulkRequest -MockWith { @() }
+        Mock -CommandName New-ExoBulkRequest -MockWith { @() }
+        Mock -CommandName New-ExoRequest -MockWith { @() }
+    }
+
+    It 'grants Send As on a <GroupType> through Add-RecipientPermission' -ForEach @(
+        @{ GroupType = 'Distribution List' }
+        @{ GroupType = 'Mail-Enabled Security' }
+        @{ GroupType = 'Microsoft 365' }
+    ) {
+        $Request = New-GroupRequest -GroupType $GroupType -Body @{
+            AddSendAs = @(New-Member -Upn 'boss@contoso.com' -Value 'boss-guid')
+        }
+
+        $null = Invoke-EditGroup -Request $Request
+
+        Should -Invoke New-ExoBulkRequest -Times 1 -Exactly -ParameterFilter {
+            $Op = $cmdletArray | Where-Object { $_.CmdletInput.CmdletName -eq 'Add-RecipientPermission' }
+            $Op.CmdletInput.Parameters.Identity -eq 'group-guid' -and
+            $Op.CmdletInput.Parameters.Trustee -eq 'boss@contoso.com' -and
+            $Op.CmdletInput.Parameters.accessRights -contains 'SendAs'
+        }
+    }
+
+    It 'removes Send As through Remove-RecipientPermission' {
+        $Request = New-GroupRequest -GroupType 'Distribution List' -Body @{
+            RemoveSendAs = @([pscustomobject]@{ label = 'drop@contoso.com'; value = 'drop@contoso.com' })
+        }
+
+        $null = Invoke-EditGroup -Request $Request
+
+        Should -Invoke New-ExoBulkRequest -Times 1 -Exactly -ParameterFilter {
+            $Op = $cmdletArray | Where-Object { $_.CmdletInput.CmdletName -eq 'Remove-RecipientPermission' }
+            $Op.CmdletInput.Parameters.Trustee -eq 'drop@contoso.com'
+        }
+    }
+
+    It 'sends every Send on Behalf change on a distribution list as one Set-DistributionGroup call' {
+        $Request = New-GroupRequest -GroupType 'Distribution List' -Body @{
+            AddSendOnBehalf    = @(New-Member -Upn 'boss@contoso.com' -Value 'boss-guid')
+            RemoveSendOnBehalf = @([pscustomobject]@{ label = 'Drop'; value = 'drop@contoso.com' })
+        }
+
+        $null = Invoke-EditGroup -Request $Request
+
+        Should -Invoke New-ExoBulkRequest -Times 1 -Exactly -ParameterFilter {
+            $Ops = @($cmdletArray | Where-Object { $_.CmdletInput.CmdletName -eq 'Set-DistributionGroup' })
+            $Change = $Ops[0].CmdletInput.Parameters.GrantSendOnBehalfTo
+            $Ops.Count -eq 1 -and
+            $Ops[0].CmdletInput.Parameters.BypassSecurityGroupManagerCheck -eq $true -and
+            $Change.'@odata.type' -eq '#Exchange.GenericHashTable' -and
+            $Change.add -contains 'boss@contoso.com' -and
+            $Change.remove -contains 'drop@contoso.com'
+        }
+    }
+
+    It 'uses Set-UnifiedGroup for Send on Behalf on a Microsoft 365 group' {
+        $Request = New-GroupRequest -GroupType 'Microsoft 365' -Body @{
+            AddSendOnBehalf = @(New-Member -Upn 'boss@contoso.com' -Value 'boss-guid')
+        }
+
+        $null = Invoke-EditGroup -Request $Request
+
+        Should -Invoke New-ExoBulkRequest -Times 1 -Exactly -ParameterFilter {
+            $Op = $cmdletArray | Where-Object { $_.CmdletInput.CmdletName -eq 'Set-UnifiedGroup' }
+            $Op.CmdletInput.Parameters.GrantSendOnBehalfTo.add -contains 'boss@contoso.com' -and
+            -not $Op.CmdletInput.Parameters.ContainsKey('BypassSecurityGroupManagerCheck')
+        }
+    }
+
+    It 'ignores send permissions on a security group that has no mailbox' {
+        $Request = New-GroupRequest -GroupType 'Security' -Body @{
+            AddSendAs       = @(New-Member -Upn 'boss@contoso.com' -Value 'boss-guid')
+            AddSendOnBehalf = @(New-Member -Upn 'boss@contoso.com' -Value 'boss-guid')
+        }
+
+        $null = Invoke-EditGroup -Request $Request
+
+        Should -Invoke New-ExoBulkRequest -Times 0 -Exactly
+    }
+
+    It 'explains a Send on Behalf rejection for a user without a mailbox' {
+        Mock -CommandName New-ExoBulkRequest -MockWith {
+            param($cmdletArray)
+            @([pscustomobject]@{
+                    target        = 'group-guid'
+                    error         = 'Ex94914C|Microsoft.Exchange.Configuration.Tasks.ManagementObjectNotFoundException|Couldn''t find object "nobox@contoso.com". Please make sure that it was spelled correctly or specify a different object.'
+                    OperationGuid = $cmdletArray[0].OperationGuid
+                })
+        }
+        $Request = New-GroupRequest -GroupType 'Distribution List' -Body @{
+            AddSendOnBehalf = @(New-Member -Upn 'nobox@contoso.com' -Value 'nobox-guid')
+        }
+
+        $Response = Invoke-EditGroup -Request $Request
+
+        $Response.Body.Results | Should -Contain 'Error - Send on Behalf was not changed on All Office: nobox@contoso.com has no mailbox. Send on Behalf can only be given to users with a mailbox.'
+    }
+
+    It 'reports each send permission change back to the operator' {
+        $Request = New-GroupRequest -GroupType 'Distribution List' -Body @{
+            AddSendAs       = @(New-Member -Upn 'boss@contoso.com' -Value 'boss-guid')
+            AddSendOnBehalf = @(New-Member -Upn 'keep@contoso.com' -Value 'keep-guid')
+        }
+
+        $Response = Invoke-EditGroup -Request $Request
+
+        $Response.Body.Results | Should -Contain 'Success - Granted boss@contoso.com Send As on All Office group'
+        $Response.Body.Results | Should -Contain 'Success - Granted keep@contoso.com Send on Behalf on All Office group'
     }
 }

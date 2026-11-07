@@ -21,9 +21,18 @@ function Push-ListGraphRequestQueue {
         Write-Information "Queue Table: $TableName"
         $Table = Get-CIPPTable -TableName $TableName
 
-        $Filter = "PartitionKey eq '{0}' and (RowKey eq '{1}' or OriginalEntityId eq '{1}')" -f $PartitionKey, $Item.TenantFilter
+        # The tenant's head row plus its page rows ('<tenant>|00001'...)
+        $Filter = "PartitionKey eq '{0}' and (RowKey eq '{1}' or OriginalEntityId eq '{1}' or (RowKey ge '{1}|' and RowKey lt '{1}}}'))" -f $PartitionKey, $Item.TenantFilter
         Write-Information "Filter: $Filter"
-        $Existing = Get-CIPPAzDataTableEntity @Table -Filter $Filter -Property PartitionKey, RowKey, OriginalEntityId
+        # Project NONE of the split-entity markers (OriginalEntityId, PartIndex, PartCount,
+        # SplitOverProps, chunk properties): excluding them all makes Get-AzDataTableLargeEntity
+        # skip reassembly and return raw physical rows, part rows named '{RowKey}-part<n>'.
+        # Projecting a SUBSET (e.g. OriginalEntityId alone) is poison - the module then
+        # recognizes a split entity, fails to reassemble it from the truncated rows, and drops
+        # it, silently losing exactly the tenants whose cached blob was split across rows.
+        # Handing the raw part rows to Remove-CIPPAzDataTableEntity is safe: its own part-row
+        # lookup skips rows already in the delete batch.
+        $Existing = Get-CIPPAzDataTableEntity @Table -Filter $Filter -Property PartitionKey, RowKey
         if ($Existing) {
             $null = Remove-CIPPAzDataTableEntity -Force @Table -Entity $Existing
         }
@@ -39,28 +48,38 @@ function Push-ListGraphRequestQueue {
             SkipCache                   = $true
         }
 
-        $RawGraphRequest = try {
-            $Results = Get-GraphRequestList @GraphRequestParams
-            if ($Results[-1].PSObject.Properties.Name -contains 'nextLink') {
-                $Results | Select-Object -First ($Results.Count - 1)
-            } else {
-                $Results
+        # Each Graph page is stored as it arrives, so a task holds one page however large the tenant is
+        $Pages = 0
+        $HeadData = '[]'
+        try {
+            Get-GraphRequestList @GraphRequestParams -JsonPages | ForEach-Object {
+                $Pages++
+                $PageRow = [PSCustomObject]@{
+                    PartitionKey = [string]$PartitionKey
+                    RowKey       = '{0}|{1:D5}' -f $Item.TenantFilter, $Pages
+                    QueueId      = [string]$Item.QueueId
+                    QueueType    = [string]$Item.QueueType
+                    Data         = [string]$_
+                }
+                Add-CIPPAzDataTableEntity @Table -Entity $PageRow -Force | Out-Null
             }
         } catch {
-            $CippException = Get-CippException -Exception $_.Exception
-            [PSCustomObject]@{
-                Tenant        = $Item.TenantFilter
-                CippStatus    = "Could not connect to tenant. $($CippException.NormalizedError)"
-                CippException = [string]($CippException | ConvertTo-Json -Depth 10 -Compress)
-            }
+            $CippException = Get-CippException -Exception $_
+            $Pages = 0
+            $HeadData = [CIPP.CippJson]::ToJson([PSCustomObject]@{
+                    Tenant        = $Item.TenantFilter
+                    CippStatus    = "Could not connect to tenant. $($CippException.NormalizedError)"
+                    CippException = [string]($CippException | ConvertTo-Json -Depth 10 -Compress)
+                })
         }
-        $Json = ConvertTo-Json -Depth 10 -Compress -InputObject $RawGraphRequest
+        # Written last: until the head row exists the tenant reads as still loading, and only its first Pages page rows count
         $GraphResults = [PSCustomObject]@{
             PartitionKey = [string]$PartitionKey
             RowKey       = [string]$Item.TenantFilter
             QueueId      = [string]$Item.QueueId
             QueueType    = [string]$Item.QueueType
-            Data         = [string]$Json
+            Pages        = [int]$Pages
+            Data         = [string]$HeadData
         }
         Add-CIPPAzDataTableEntity @Table -Entity $GraphResults -Force | Out-Null
 

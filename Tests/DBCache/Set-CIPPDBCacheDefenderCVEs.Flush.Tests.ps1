@@ -2,15 +2,16 @@
 #
 # The collector streams rows into a single Add-CIPPDbItem pipeline on purpose. Add-CIPPDbItem
 # runs its orphan cleanup and writes DefenderCVEs-Count once per pipeline, in its end block,
-# against the RunStartUtc captured in its begin block. Splitting the flush across several
-# calls would make each later call's cleanup delete rows written by earlier ones once the run
-# exceeded the skew margin, and would leave the stored count equal to the final chunk. These
-# tests fail if anyone reintroduces a per-chunk flush.
+# keyed to the run id minted in its begin block. Splitting the flush across several calls
+# would give each chunk its own run id, so each later call's cleanup would treat earlier
+# chunks' rows as orphans once the run exceeded the skew margin, and would leave the stored
+# count equal to the final chunk. These tests fail if anyone reintroduces a per-chunk flush.
 
 BeforeAll {
     $RepoRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $PSCommandPath))
     $CollectorPath = Join-Path $RepoRoot 'Modules/CIPPDB/Public/DBCache/Set-CIPPDBCacheDefenderCVEs.ps1'
     $DbItemPath = Join-Path $RepoRoot 'Modules/CIPPCore/Public/Add-CIPPDbItem.ps1'
+    Add-Type -Path (Join-Path $RepoRoot 'Shared/CIPPSharp/bin/CIPPSharp.dll')
 
     # -Force MUST be declared [switch] here: without it the real call sites' trailing -Force
     # binds no argument and the resulting error is swallowed by the collector's own catch.
@@ -21,7 +22,7 @@ BeforeAll {
     function Get-Tenants { param($TenantFilter, [switch]$IncludeErrors) }
     function Add-CIPPAzDataTableEntity { param($Context, $Entity, [switch]$Force, [switch]$CreateTableIfNotExists) }
     function Get-CIPPAzDataTableEntity { param($Context, $Filter, $Property) }
-    function Remove-CIPPAzDataTableEntity { param($Context, $Entity, [switch]$Force) }
+    function Remove-AzDataTableEntity { param($Context, $Entity, [switch]$Force) }
 
     . $DbItemPath
     . $CollectorPath
@@ -65,7 +66,7 @@ Describe 'Set-CIPPDBCacheDefenderCVEs flush semantics' {
         Mock -CommandName Get-CippException -MockWith { @{ NormalizedError = $Exception.Exception.Message } }
         Mock -CommandName Get-CippTable -MockWith { @{} }
         Mock -CommandName Get-CIPPAzDataTableEntity -MockWith { @() }
-        Mock -CommandName Remove-CIPPAzDataTableEntity -MockWith { $script:Removed.AddRange(@($Entity)) }
+        Mock -CommandName Remove-AzDataTableEntity -MockWith { $script:Removed.AddRange(@($Entity)) }
         Mock -CommandName Add-CIPPAzDataTableEntity -MockWith { $script:Writes.Add(@($Entity)) }
     }
 
@@ -122,7 +123,8 @@ Describe 'Set-CIPPDBCacheDefenderCVEs flush semantics' {
         $Batch.Count | Should -Be 1
         $Batch[0].PartitionKey | Should -Be $script:Tenant
         $Batch[0].Type | Should -Be 'DefenderCVEs'
-        $Batch[0].RowKey | Should -BeLike 'DefenderCVEs-*'
+        # Stable, idempotent RowKey derived from the CVE id (was a random GUID per run).
+        $Batch[0].RowKey | Should -Be 'DefenderCVEs-CVE-2024-0001'
 
         # Get-CIPPCVEReport reads these fields off the deserialised Data blob.
         $Payload = $Batch[0].Data | ConvertFrom-Json
@@ -132,19 +134,23 @@ Describe 'Set-CIPPDBCacheDefenderCVEs flush semantics' {
         ($Payload.deviceDetailsJson | ConvertFrom-Json).deviceName | Should -Be @('PC-d1', 'PC-d2')
     }
 
-    It 'deletes only rows left over from an earlier run' {
+    It 'deletes only rows left over from an earlier run, never rows this run wrote' {
         Mock -CommandName Get-DefenderTvmRaw -MockWith { New-TvmRecord -cveId 'CVE-A' -deviceId 'd1' }
+        # Feed one of this run's own writes back through the cleanup query alongside a
+        # foreign row. The delete authority is the RunId stamped on every written row -
+        # identity, not age - so however slow the run or however far the storage clock
+        # drifts, only the foreign row may go.
         Mock -CommandName Get-CIPPAzDataTableEntity -MockWith {
-            @(
-                [pscustomobject]@{ PartitionKey = 'contoso.onmicrosoft.com'; RowKey = 'DefenderCVEs-stale'; Timestamp = [datetimeoffset]::UtcNow.AddDays(-1) }
-                [pscustomobject]@{ PartitionKey = 'contoso.onmicrosoft.com'; RowKey = 'DefenderCVEs-fresh'; Timestamp = [datetimeoffset]::UtcNow }
-            )
+            $OwnRows = foreach ($Write in $script:Writes) {
+                foreach ($E in $Write) { if ($E.RowKey -notlike '*-Count') { $E } }
+            }
+            @([pscustomobject]@{ PartitionKey = 'contoso.onmicrosoft.com'; RowKey = 'DefenderCVEs-from-earlier-run'; ETag = '*' }) + @($OwnRows)
         }
 
         Set-CIPPDBCacheDefenderCVEs -TenantFilter $script:Tenant
 
         @($script:Removed).Count | Should -Be 1
-        $script:Removed[0].RowKey | Should -Be 'DefenderCVEs-stale'
+        $script:Removed[0].RowKey | Should -Be 'DefenderCVEs-from-earlier-run'
     }
 
     It 'does not touch the table when the fetch faults mid-stream' {
@@ -156,6 +162,6 @@ Describe 'Set-CIPPDBCacheDefenderCVEs flush semantics' {
         { Set-CIPPDBCacheDefenderCVEs -TenantFilter $script:Tenant } | Should -Throw
 
         Should -Invoke Add-CIPPAzDataTableEntity -Times 0 -Exactly
-        Should -Invoke Remove-CIPPAzDataTableEntity -Times 0 -Exactly
+        Should -Invoke Remove-AzDataTableEntity -Times 0 -Exactly
     }
 }

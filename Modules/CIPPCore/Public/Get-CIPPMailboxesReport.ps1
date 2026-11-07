@@ -4,10 +4,17 @@ function Get-CIPPMailboxesReport {
         Generates a mailboxes report from the CIPP Reporting database
 
     .DESCRIPTION
-        Retrieves mailbox data for a tenant from the reporting database
+        Retrieves mailbox data for a tenant from the reporting database. AllTenants reads are paged only.
 
     .PARAMETER TenantFilter
         The tenant to generate the report for
+
+    .PARAMETER PageSize
+        When set, returns one page of at most this many rows as @{ Items; NextToken }, in table walk order.
+        Required for AllTenants.
+
+    .PARAMETER ContinuationToken
+        NextToken from the previous page. Only meaningful together with PageSize.
 
     .EXAMPLE
         Get-CIPPMailboxesReport -TenantFilter 'contoso.onmicrosoft.com'
@@ -16,53 +23,54 @@ function Get-CIPPMailboxesReport {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
-        [string]$TenantFilter
+        [string]$TenantFilter,
+        [int]$PageSize,
+        [string]$ContinuationToken
     )
 
     try {
-        # Handle AllTenants
-        if ($TenantFilter -eq 'AllTenants') {
-            # Get all tenants that have mailbox data
-            $AllMailboxItems = Get-CIPPDbItem -TenantFilter 'allTenants' -Type 'Mailboxes'
-            $Tenants = @($AllMailboxItems | Where-Object { $_.RowKey -ne 'Mailboxes-Count' } | Select-Object -ExpandProperty PartitionKey -Unique)
-
-            $TenantList = Get-Tenants -IncludeErrors
-            $Tenants = $Tenants | Where-Object { $TenantList.defaultDomainName -contains $_ }
-
-            $AllResults = [System.Collections.Generic.List[PSCustomObject]]::new()
-            foreach ($Tenant in $Tenants) {
-                try {
-                    $TenantResults = Get-CIPPMailboxesReport -TenantFilter $Tenant
-                    foreach ($Result in $TenantResults) {
-                        # Add Tenant property to each result
-                        $Result | Add-Member -NotePropertyName 'Tenant' -NotePropertyValue $Tenant -Force
-                        $AllResults.Add($Result)
-                    }
-                } catch {
-                    Write-LogMessage -API 'MailboxesReport' -tenant $Tenant -message "Failed to get report for tenant: $($_.Exception.Message)" -sev Warning
-                }
+        if ($PageSize -gt 0) {
+            $Page = Get-CIPPDbItemPage -TenantFilter $TenantFilter -Type 'Mailboxes' -PageSize $PageSize -ContinuationToken $ContinuationToken
+            if ($TenantFilter -ne 'AllTenants' -and -not $ContinuationToken -and @($Page.Items).Count -eq 0 -and -not $Page.NextToken) {
+                throw 'No mailbox data found in reporting database. Sync the report data first.'
             }
-            return $AllResults
+            $Results = [System.Collections.Generic.List[PSCustomObject]]::new()
+            foreach ($Item in $Page.Items) {
+                $Mailbox = [CIPP.CippJson]::ConvertFromJson($Item.Data)
+                if ($null -eq $Mailbox) { continue }
+                $Props = $Mailbox.PSObject.Properties
+                # Per-item timestamp: a page may span tenants.
+                $Props.Remove('CacheTimestamp'); $Props.Add([psnoteproperty]::new('CacheTimestamp', $Item.Timestamp))
+                if ($TenantFilter -eq 'AllTenants') {
+                    $Props.Remove('Tenant'); $Props.Add([psnoteproperty]::new('Tenant', $Item.PartitionKey))
+                }
+                $Results.Add($Mailbox)
+            }
+            return [PSCustomObject]@{
+                Items     = $Results
+                NextToken = $Page.NextToken
+            }
         }
 
-        # Get mailboxes from reporting DB
-        $MailboxItems = Get-CIPPDbItem -TenantFilter $TenantFilter -Type 'Mailboxes' | Where-Object { $_.RowKey -ne 'Mailboxes-Count' }
-        if (-not $MailboxItems) {
+        if ($TenantFilter -eq 'AllTenants') {
+            throw [System.ArgumentException]::new('AllTenants mailbox reads are paged: pass -PageSize.')
+        }
+
+        $CacheTimestamp = $null
+        $AllMailboxes = [System.Collections.Generic.List[PSCustomObject]]::new()
+        foreach ($Item in @(Get-CIPPDbItem -TenantFilter $TenantFilter -Type 'Mailboxes')) {
+            if ($Item.RowKey -eq 'Mailboxes-Count') { continue }
+            if ($Item.Timestamp -and (-not $CacheTimestamp -or $Item.Timestamp -gt $CacheTimestamp)) { $CacheTimestamp = $Item.Timestamp }
+            $Mailbox = [CIPP.CippJson]::ConvertFromJson($Item.Data)
+            if ($null -ne $Mailbox) { $AllMailboxes.Add($Mailbox) }
+        }
+        if ($AllMailboxes.Count -eq 0) {
             throw 'No mailbox data found in reporting database. Sync the report data first.'
         }
 
-        # Get the most recent cache timestamp
-        $CacheTimestamp = ($MailboxItems | Where-Object { $_.Timestamp } | Sort-Object Timestamp -Descending | Select-Object -First 1).Timestamp
-
-        # Parse mailbox data
-        $AllMailboxes = [System.Collections.Generic.List[PSCustomObject]]::new()
-        foreach ($Item in $MailboxItems | Where-Object { $_.RowKey -ne 'Mailboxes-Count' }) {
-            $Mailbox = $Item.Data | ConvertFrom-Json
-
-            # Add cache timestamp
-            $Mailbox | Add-Member -NotePropertyName 'CacheTimestamp' -NotePropertyValue $CacheTimestamp -Force
-
-            $AllMailboxes.Add($Mailbox)
+        foreach ($Mailbox in $AllMailboxes) {
+            $Props = $Mailbox.PSObject.Properties
+            $Props.Remove('CacheTimestamp'); $Props.Add([psnoteproperty]::new('CacheTimestamp', $CacheTimestamp))
         }
 
         return $AllMailboxes | Sort-Object -Property displayName

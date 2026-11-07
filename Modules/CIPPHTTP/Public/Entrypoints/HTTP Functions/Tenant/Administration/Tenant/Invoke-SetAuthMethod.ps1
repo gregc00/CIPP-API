@@ -32,14 +32,15 @@ function Invoke-SetAuthMethod {
         $OptionalSettings = @(
             'TAPisUsableOnce', 'TAPMinimumLifetime', 'TAPMaximumLifetime', 'TAPDefaultLifeTime', 'TAPDefaultLength'
             'MicrosoftAuthenticatorSoftwareOathEnabled', 'MicrosoftAuthenticatorDisplayAppInfo', 'MicrosoftAuthenticatorDisplayLocation', 'MicrosoftAuthenticatorCompanionApp'
-            'EmailAllowExternalIdToUseEmailOtp', 'EmailExcludeGroupIds'
+            'EmailAllowExternalIdToUseEmailOtp', 'EmailExcludeGroupIds', 'ExcludeGroupIds'
             'QRCodeLifetimeInDays', 'QRCodePinLength'
             'FIDO2AttestationEnforced', 'FIDO2SelfServiceRegistration', 'VoiceIsOfficePhoneAllowed'
             'SmsIsUsableForSignIn'
         )
         foreach ($Setting in $OptionalSettings) {
             if ($null -ne $Request.Body.$Setting) {
-                $Params.$Setting = $Request.Body.$Setting
+                # select fields arrive as {label, value}
+                $Params.$Setting = $Request.Body.$Setting.value ?? $Request.Body.$Setting
             }
         }
         $Result = Set-CIPPAuthenticationPolicy @Params

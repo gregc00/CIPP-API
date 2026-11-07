@@ -7,9 +7,9 @@ function Start-AuditLogIngestionV2 {
         Runs offset 15 minutes from the creation timer and fans out two kinds of work:
 
           1. Download tenants - AuditLogCoverage rows in state 'Created' (a search was created and is
-             awaiting download) and due (not in backoff). Each gets a per-tenant orchestrator:
-                 Batch         = AuditLogDownloadV2  (download succeeded searches -> CacheWebhooks)
-                 PostExecution = AuditLogProcessV2   (enqueue processing if any cache rows are pending)
+             awaiting download) and due (not in backoff). Each gets a per-tenant AuditLogDownloadV2
+             task, which downloads succeeded searches to CacheWebhooks and starts processing itself
+             only when a window was downloaded.
 
           2. Process-only tenants - tenants that have rows sitting in CacheWebhooks (downloaded but
              not yet processed, e.g. left behind by a worker crash mid-processing) but no pending
@@ -27,18 +27,27 @@ function Start-AuditLogIngestionV2 {
         $Ledger = Get-CippTable -TableName 'AuditLogCoverage'
         $Now = (Get-Date).ToUniversalTime()
 
-        # --- Download tenants: searches awaiting download (State = Created, due) ---
+        # One projected pass over the ledger, split into both work sets. State is not a key, so
+        # this is a table scan whatever the predicate; what's controllable is paying it once
+        # instead of once per state, and reading three columns instead of whole rows.
+        # AuditLogCoverage is one row per window (not per record) and pruned at 7 days, so it
+        # stays bounded. A partition query per in-scope tenant would trade this for N round trips.
         $DownloadTenants = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-        foreach ($Row in @(Get-CIPPAzDataTableEntity @Ledger -Filter "State eq 'Created'" -Property @('PartitionKey', 'RowKey', 'NextAttemptUtc'))) {
-            if ($Row.NextAttemptUtc -and ([datetimeoffset]$Row.NextAttemptUtc).UtcDateTime -gt $Now) { continue }
-            if ($Row.PartitionKey) { [void]$DownloadTenants.Add([string]$Row.PartitionKey) }
-        }
-
-        # --- Process-only tenants: rows pending in the webhook cache (downloaded, not yet processed) ---
-        $CacheTable = Get-CippTable -TableName 'CacheWebhooks'
         $CacheTenants = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-        foreach ($Row in @(Get-CIPPAzDataTableEntity @CacheTable -Property @('PartitionKey', 'RowKey'))) {
-            if ($Row.PartitionKey) { [void]$CacheTenants.Add([string]$Row.PartitionKey) }
+
+        $Active = @(Get-CIPPAzDataTableEntity @Ledger `
+                -Filter "State eq 'Created' or State eq 'Downloaded' or State eq 'Processing'" `
+                -Property @('PartitionKey', 'State', 'NextAttemptUtc', 'Timestamp'))
+        $Stale = $Now.AddHours(-2)
+
+        foreach ($Row in $Active) {
+            if (-not $Row.PartitionKey) { continue }
+            if ($Row.State -eq 'Created') {
+                if ($Row.NextAttemptUtc -and ([datetimeoffset]$Row.NextAttemptUtc).UtcDateTime -gt $Now) { continue }
+                [void]$DownloadTenants.Add([string]$Row.PartitionKey)
+            } elseif ($Row.State -eq 'Downloaded' -or ($Row.Timestamp -and $Row.Timestamp.UtcDateTime -lt $Stale)) {
+                [void]$CacheTenants.Add([string]$Row.PartitionKey)
+            }
         }
 
         if ($DownloadTenants.Count -eq 0 -and $CacheTenants.Count -eq 0) {
@@ -46,14 +55,15 @@ function Start-AuditLogIngestionV2 {
             return
         }
 
-        # 1) Download tenants -> download + post-exec processing in one orchestration.
+        # 1) Download tenants -> the download task starts processing when it has anything to process.
         foreach ($TenantFilter in $DownloadTenants) {
             if ($PSCmdlet.ShouldProcess($TenantFilter, 'Download + process audit logs')) {
                 Start-CIPPOrchestrator -InputObject ([PSCustomObject]@{
                         OrchestratorName = "AuditLogIngestV2-$TenantFilter"
+                        AllowCollision   = $false
                         Batch            = @([PSCustomObject]@{ FunctionName = 'AuditLogDownloadV2'; TenantFilter = $TenantFilter })
-                        PostExecution    = @{ FunctionName = 'AuditLogProcessV2'; Parameters = @{ TenantFilter = $TenantFilter } }
                         SkipLog          = $true
+                        Priority         = 3
                     })
             }
         }
@@ -66,8 +76,10 @@ function Start-AuditLogIngestionV2 {
             if ($PSCmdlet.ShouldProcess($TenantFilter, 'Process pending audit logs')) {
                 Start-CIPPOrchestrator -InputObject ([PSCustomObject]@{
                         OrchestratorName = "AuditLogProcessV2-$TenantFilter"
+                        AllowCollision   = $false
                         QueueFunction    = [PSCustomObject]@{ FunctionName = 'AuditLogProcessingBatchV2'; Parameters = @{ TenantFilter = $TenantFilter } }
                         SkipLog          = $true
+                        Priority         = 3
                     })
             }
         }

@@ -53,12 +53,15 @@ function Set-CIPPDBCacheOneDriveRootPermissions {
         $LicenseCheck = Test-CIPPStandardLicense -StandardName 'OneDriveRootPermissionsCache' -TenantFilter $TenantFilter -Preset SharePoint -SkipLog
         if ($LicenseCheck -eq $false) {
             Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message 'Tenant does not have SharePoint/OneDrive license, skipping OneDrive root permissions cache' -sev Debug
+            # A license skip is still a completed collection: record the authoritative empty set
+            # so collect-on-miss does not re-run this collector forever on unlicensed tenants.
+            Add-CIPPDbItem -TenantFilter $TenantFilter -Type 'OneDriveRootPermissions' -Data @() -AddCount -ClearOnEmpty
             return
         }
 
         Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message 'Starting OneDrive root permissions collection' -sev Debug
 
-        $RawSites = @(New-GraphGetRequest -uri "https://graph.microsoft.com/v1.0/sites/getAllSites?`$filter=isPersonalSite eq true&`$select=id,webUrl,displayName" -tenantid $TenantFilter -asapp $true)
+        $RawSites = @(New-GraphGetRequest -uri "https://graph.microsoft.com/v1.0/sites/getAllSites?`$filter=isPersonalSite eq true&`$select=id,webUrl,displayName,isPersonalSite" -tenantid $TenantFilter -asapp $true)
 
         $SiteById = @{}
         foreach ($Site in $RawSites) {
@@ -110,6 +113,7 @@ function Set-CIPPDBCacheOneDriveRootPermissions {
         $InputObject = [PSCustomObject]@{
             Batch            = @($Batches)
             OrchestratorName = "OneDriveRootPermissions_$TenantFilter"
+            AllowCollision   = $false
             PostExecution    = @{
                 FunctionName = 'StoreOneDriveRootPermissions'
                 Parameters   = @{

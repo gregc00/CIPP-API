@@ -54,9 +54,13 @@ function New-CIPPBackup {
                         'Extensions'
                         'WebhookRules'
                         'ScheduledTasks'
+                        'DeltaQueries'
                         'TenantProperties'
                         'TenantGroups'
                         'TenantGroupMembers'
+                        'BaselineRollouts'
+                        'Baselines'
+                        'BaselineRolloutState'
                     )
                     $CSVfile = foreach ($CSVTable in $BackupTables) {
                         $Table = Get-CippTable -tablename $CSVTable

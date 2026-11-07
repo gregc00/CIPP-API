@@ -15,14 +15,24 @@ BeforeAll {
     function New-GraphBulkRequest { param($Requests, $AsApp, $TenantId) }
     function Get-CippAuditLogSearchResults { param($TenantFilter, $QueryId, [switch]$CountOnly) }
     function Get-CippAuditLogNextAttempt { param($Attempts) }
+    function Get-CIPPAuditLogRuleSet { param($TenantFilter) }
+    function Start-CIPPOrchestrator { param($InputObject) }
+
+    function New-Rule {
+        param([object[]]$Conditions, $Excluded)
+        [pscustomobject]@{ Conditions = (ConvertTo-Json -InputObject @($Conditions) -Depth 5 -Compress); Excluded = $Excluded }
+    }
+    function New-Condition([string]$Property, [string]$Operator, $Value) {
+        @{ Property = @{ label = $Property; value = 'String' }; Operator = @{ label = $Operator; value = $Operator }; Input = @{ value = $Value } }
+    }
 
     function New-AuditRecord {
-        param([string]$Id, [string]$Created = '2026-07-29T09:00:00Z')
+        param([string]$Id, [string]$Created = '2026-07-29T09:00:00Z', [string]$Operation = 'Set-Mailbox')
         [pscustomobject]@{
             id              = $Id
             createdDateTime = $Created
-            operation       = 'Set-Mailbox'
-            auditData       = [pscustomobject]@{ ResultStatus = 'Success' }
+            operation       = $Operation
+            auditData       = [pscustomobject]@{ ResultStatus = 'Success'; Operation = $Operation }
         }
     }
 
@@ -33,6 +43,10 @@ Describe 'Push-AuditLogDownloadV2' {
 
     BeforeEach {
         $script:CacheWrites = [System.Collections.Generic.List[object]]::new()
+        # One entry per Add-CIPPAzDataTableEntity call, holding that call's entities. The download
+        # stage writes in batches, so the number of calls and the number of rows are different
+        # things and both are worth pinning: rows for correctness, calls for the batching itself.
+        $script:CacheWriteBatches = [System.Collections.Generic.List[object]]::new()
         $script:LedgerWrites = [System.Collections.Generic.List[object]]::new()
         $script:SearchResults = @()
         $script:SearchStatus = 'succeeded'
@@ -60,8 +74,11 @@ Describe 'Push-AuditLogDownloadV2' {
 
         Mock -CommandName Add-CIPPAzDataTableEntity -MockWith {
             param($TableName, $Context, $Entity, $Force, $OperationType)
-            if ($TableName -eq 'CacheWebhooks') { $script:CacheWrites.Add($Entity) }
-            else { $script:LedgerWrites.Add($Entity) }
+            if ($TableName -eq 'CacheWebhooks') {
+                $Batch = @($Entity)
+                $script:CacheWriteBatches.Add($Batch)
+                foreach ($Row in $Batch) { $script:CacheWrites.Add($Row) }
+            } else { $script:LedgerWrites.Add($Entity) }
         }
 
         Mock -CommandName New-GraphBulkRequest -MockWith {
@@ -74,6 +91,9 @@ Describe 'Push-AuditLogDownloadV2' {
         }
 
         Mock -CommandName Get-CippAuditLogNextAttempt -MockWith { (Get-Date).ToUniversalTime().AddMinutes(10).ToString('o') }
+        $script:Rules = @(New-Rule @(New-Condition 'ResultStatus' 'eq' 'Success'))
+        Mock -CommandName Get-CIPPAuditLogRuleSet -MockWith { $script:Rules }
+        Mock -CommandName Start-CIPPOrchestrator -MockWith {}
     }
 
     Context 'succeeded search with records' {
@@ -90,10 +110,20 @@ Describe 'Push-AuditLogDownloadV2' {
             $null = Push-AuditLogDownloadV2 -Item @{ TenantFilter = 'contoso.com' }
             ($script:CacheWrites.RowKey | Sort-Object) | Should -Be @('rec-1', 'rec-2', 'rec-3')
             $first = $script:CacheWrites | Where-Object { $_.RowKey -eq 'rec-1' }
-            $first.PartitionKey | Should -Be 'contoso.com'
             $first.SearchId | Should -Be 'search-1'
             ($first.JSON | ConvertFrom-Json).id | Should -Be 'rec-1'
             $first.CippProcessing | Should -BeFalse
+        }
+
+        It 'partitions the cache per search, not per tenant' {
+            # Azure Table only point-looks-up a single PartitionKey+RowKey pair, so a per-tenant
+            # partition forces the processing stage to select rows with an OR-list of RowKeys -
+            # which cannot use the index and scans. One partition per search keeps every read in
+            # the processing path a point-partition query.
+            $null = Push-AuditLogDownloadV2 -Item @{ TenantFilter = 'contoso.com' }
+            $first = $script:CacheWrites | Where-Object { $_.RowKey -eq 'rec-1' }
+            $first.PartitionKey | Should -Be 'contoso.com|search-1'
+            $first.TenantFilter | Should -Be 'contoso.com'
         }
 
         It 'advances the ledger to Downloaded with the record count' {
@@ -109,10 +139,154 @@ Describe 'Push-AuditLogDownloadV2' {
             $result.Success | Should -BeTrue
             $result.Downloaded | Should -Be 3
         }
+
+        It 'starts processing for the tenant once' {
+            $null = Push-AuditLogDownloadV2 -Item @{ TenantFilter = 'contoso.com' }
+            Should -Invoke Start-CIPPOrchestrator -Times 1 -Exactly -ParameterFilter { $InputObject.QueueFunction.Parameters.TenantFilter -eq 'contoso.com' }
+        }
+    }
+
+    Context 'operation prefilter' {
+        # Dropping a record a rule would have matched loses an alert; keeping one it cannot match only costs storage.
+        BeforeEach {
+            $script:SearchResults = @(
+                New-AuditRecord 'rec-1' -Operation 'Set-Mailbox'
+                New-AuditRecord 'rec-2' -Operation 'UserLoggedIn'
+                New-AuditRecord 'rec-3' -Operation "New-InboxRule$([char]0x200B)"
+            )
+        }
+
+        It 'stores only the records an eq or in rule could match, case-insensitively' {
+            $script:Rules = @(
+                New-Rule @((New-Condition 'Operation' 'eq' 'new-inboxrule'), (New-Condition 'ForwardTo' 'like' '*@*'))
+                New-Rule @(New-Condition 'Operation' 'in' @('Add member to role.', 'set-mailbox'))
+            )
+            $result = Push-AuditLogDownloadV2 -Item @{ TenantFilter = 'contoso.com' }
+            ($script:CacheWrites.RowKey | Sort-Object) | Should -Be @('rec-1', 'rec-3')
+            $result.Downloaded | Should -Be 2
+            $ledger = $script:LedgerWrites | Where-Object { $_.RowKey -eq 'window-1' } | Select-Object -Last 1
+            $ledger.RecordCount | Should -Be 3
+            $ledger.CandidateCount | Should -Be 2
+            $ledger.State | Should -Be 'Downloaded'
+        }
+
+        It 'keeps every record when a rule tests Operation with <Operator>' -ForEach @(
+            @{ Operator = 'ne' }, @{ Operator = 'notin' }, @{ Operator = 'like' }, @{ Operator = 'match' }
+        ) {
+            $script:Rules = @(
+                New-Rule @(New-Condition 'Operation' 'eq' 'New-InboxRule')
+                New-Rule @(New-Condition 'Operation' $Operator 'Set-Mailbox')
+            )
+            $null = Push-AuditLogDownloadV2 -Item @{ TenantFilter = 'contoso.com' }
+            $script:CacheWrites.Count | Should -Be 3
+        }
+
+        It 'ignores rules that exclude the tenant or have only empty conditions' {
+            $script:Rules = @(
+                New-Rule @(New-Condition 'Operation' 'eq' 'UserLoggedIn')
+                New-Rule @(New-Condition 'ResultStatus' 'eq' 'Failed') -Excluded @([pscustomobject]@{ value = 'contoso.com' })
+                New-Rule @(New-Condition 'Operation' 'eq' '')
+            )
+            $null = Push-AuditLogDownloadV2 -Item @{ TenantFilter = 'contoso.com' }
+            @($script:CacheWrites.RowKey) | Should -Be @('rec-2')
+        }
+
+        It 'settles a window with no matchable records without processing' {
+            $script:Rules = @()
+            $null = Push-AuditLogDownloadV2 -Item @{ TenantFilter = 'contoso.com' }
+            $script:CacheWrites.Count | Should -Be 0
+            ($script:LedgerWrites | Where-Object { $_.RowKey -eq 'window-1' } | Select-Object -Last 1).State | Should -Be 'Processed'
+            Should -Invoke Start-CIPPOrchestrator -Times 0
+        }
+
+        It 'reads the rules once per run' {
+            Mock -CommandName Get-CIPPAzDataTableEntity -MockWith {
+                @(
+                    [pscustomobject]@{ PartitionKey = 'contoso.com'; RowKey = 'window-1'; State = 'Created'; SearchId = 'search-1'; CreatedUtc = (Get-Date).ToUniversalTime().AddMinutes(-5).ToString('o'); Attempts = 0; RetryCount = 0 }
+                    [pscustomobject]@{ PartitionKey = 'contoso.com'; RowKey = 'window-2'; State = 'Created'; SearchId = 'search-2'; CreatedUtc = (Get-Date).ToUniversalTime().AddMinutes(-5).ToString('o'); Attempts = 0; RetryCount = 0 }
+                )
+            }
+            Mock -CommandName New-GraphBulkRequest -MockWith {
+                @(
+                    [pscustomobject]@{ body = [pscustomobject]@{ id = 'search-1'; status = 'succeeded' } }
+                    [pscustomobject]@{ body = [pscustomobject]@{ id = 'search-2'; status = 'succeeded' } }
+                )
+            }
+            $null = Push-AuditLogDownloadV2 -Item @{ TenantFilter = 'contoso.com' }
+            Should -Invoke Get-CIPPAuditLogRuleSet -Times 1 -Exactly
+        }
+    }
+
+    Context 'batched cache writes' {
+        # The stage used to issue one table round trip per record. Every record in a window shares
+        # the tenant|searchId partition, so they are batchable, and the table service caps a
+        # transaction at 100 entities sharing a PartitionKey.
+
+        It 'writes a 250-record window in 3 calls, not 250' {
+            $script:SearchResults = @(1..250 | ForEach-Object { New-AuditRecord "rec-$_" })
+            $null = Push-AuditLogDownloadV2 -Item @{ TenantFilter = 'contoso.com' }
+            $script:CacheWrites.Count | Should -Be 250
+            $script:CacheWriteBatches.Count | Should -Be 3
+        }
+
+        It 'never exceeds the 100-entity transaction limit' {
+            $script:SearchResults = @(1..250 | ForEach-Object { New-AuditRecord "rec-$_" })
+            $null = Push-AuditLogDownloadV2 -Item @{ TenantFilter = 'contoso.com' }
+            foreach ($Batch in $script:CacheWriteBatches) { @($Batch).Count | Should -BeLessOrEqual 100 }
+        }
+
+        It 'flushes a trailing partial batch' {
+            # 120 records is one full batch plus a remainder; without the post-loop flush the last
+            # 20 would be counted as downloaded and the window marked Downloaded, but never written
+            # - the search would then settle with rows that do not exist.
+            $script:SearchResults = @(1..120 | ForEach-Object { New-AuditRecord "rec-$_" })
+            $result = Push-AuditLogDownloadV2 -Item @{ TenantFilter = 'contoso.com' }
+            $script:CacheWrites.Count | Should -Be 120
+            $script:CacheWriteBatches.Count | Should -Be 2
+            $result.Downloaded | Should -Be 120
+            ($script:CacheWrites.RowKey | Sort-Object -Unique).Count | Should -Be 120
+        }
+
+        It 'keeps every batch within a single partition' {
+            # A transaction spanning two PartitionKeys is rejected outright, so a buffer shared
+            # across windows would fail the whole download rather than degrade.
+            Mock -CommandName Get-CIPPAzDataTableEntity -MockWith {
+                @(
+                    [pscustomobject]@{ PartitionKey = 'contoso.com'; RowKey = 'window-1'; State = 'Created'; SearchId = 'search-1'; CreatedUtc = (Get-Date).ToUniversalTime().AddMinutes(-5).ToString('o'); Attempts = 0; RetryCount = 0 }
+                    [pscustomobject]@{ PartitionKey = 'contoso.com'; RowKey = 'window-2'; State = 'Created'; SearchId = 'search-2'; CreatedUtc = (Get-Date).ToUniversalTime().AddMinutes(-5).ToString('o'); Attempts = 0; RetryCount = 0 }
+                )
+            }
+            Mock -CommandName New-GraphBulkRequest -MockWith {
+                @(
+                    [pscustomobject]@{ body = [pscustomobject]@{ id = 'search-1'; status = 'succeeded' } }
+                    [pscustomobject]@{ body = [pscustomobject]@{ id = 'search-2'; status = 'succeeded' } }
+                )
+            }
+            # Deliberately not a multiple of the flush size, so window 1 ends mid-buffer and a
+            # buffer that outlived the window would carry rows into window 2's batch.
+            Mock -CommandName Get-CippAuditLogSearchResults -MockWith {
+                param($TenantFilter, $QueryId, [switch]$CountOnly)
+                1..150 | ForEach-Object { New-AuditRecord "$QueryId-rec-$_" }
+            }
+
+            $null = Push-AuditLogDownloadV2 -Item @{ TenantFilter = 'contoso.com' }
+
+            $script:CacheWrites.Count | Should -Be 300
+            foreach ($Batch in $script:CacheWriteBatches) {
+                (@($Batch).PartitionKey | Sort-Object -Unique).Count | Should -Be 1
+            }
+            (@($script:CacheWrites | Where-Object { $_.PartitionKey -eq 'contoso.com|search-1' }).Count) | Should -Be 150
+            (@($script:CacheWrites | Where-Object { $_.PartitionKey -eq 'contoso.com|search-2' }).Count) | Should -Be 150
+        }
     }
 
     Context 'succeeded search with no records' {
         BeforeEach { $script:SearchResults = @() }
+
+        It 'does not start processing' {
+            $null = Push-AuditLogDownloadV2 -Item @{ TenantFilter = 'contoso.com' }
+            Should -Invoke Start-CIPPOrchestrator -Times 0
+        }
 
         It 'marks an empty window Processed rather than leaving it Downloaded' {
             $null = Push-AuditLogDownloadV2 -Item @{ TenantFilter = 'contoso.com' }
@@ -183,9 +357,10 @@ Describe 'Push-AuditLogDownloadV2' {
             $ledger.SearchStatus | Should -Be 'running'
         }
 
-        It 'writes no cache rows' {
+        It 'writes no cache rows and starts no processing' {
             $null = Push-AuditLogDownloadV2 -Item @{ TenantFilter = 'contoso.com' }
             $script:CacheWrites.Count | Should -Be 0
+            Should -Invoke Start-CIPPOrchestrator -Times 0
         }
     }
 
@@ -194,11 +369,44 @@ Describe 'Push-AuditLogDownloadV2' {
             Mock -CommandName Get-CIPPAzDataTableEntity -MockWith { @() }
         }
 
-        It 'returns early without polling graph' {
+        It 'neither polls graph nor starts processing' {
             $result = Push-AuditLogDownloadV2 -Item @{ TenantFilter = 'contoso.com' }
             $result.Success | Should -BeTrue
             $result.Downloaded | Should -Be 0
             Should -Invoke New-GraphBulkRequest -Times 0
+            Should -Invoke Start-CIPPOrchestrator -Times 0
+        }
+    }
+
+    Context 'window downloaded earlier and not yet processed' {
+        BeforeEach {
+            Mock -CommandName Get-CIPPAzDataTableEntity -MockWith {
+                [pscustomobject]@{ PartitionKey = 'contoso.com'; RowKey = 'window-0'; State = 'Downloaded'; SearchId = 'search-0' }
+            }
+        }
+
+        It 'starts processing without polling graph' {
+            $null = Push-AuditLogDownloadV2 -Item @{ TenantFilter = 'contoso.com' }
+            Should -Invoke New-GraphBulkRequest -Times 0
+            Should -Invoke Start-CIPPOrchestrator -Times 1 -Exactly
+        }
+    }
+
+    Context 'window still being processed' {
+        It 'leaves a run that is still going alone' {
+            Mock -CommandName Get-CIPPAzDataTableEntity -MockWith {
+                [pscustomobject]@{ PartitionKey = 'contoso.com'; RowKey = 'window-0'; State = 'Processing'; SearchId = 'search-0'; Timestamp = [datetimeoffset]::UtcNow.AddMinutes(-10) }
+            }
+            $null = Push-AuditLogDownloadV2 -Item @{ TenantFilter = 'contoso.com' }
+            Should -Invoke Start-CIPPOrchestrator -Times 0
+        }
+
+        It 'restarts processing once the claim has gone stale' {
+            Mock -CommandName Get-CIPPAzDataTableEntity -MockWith {
+                [pscustomobject]@{ PartitionKey = 'contoso.com'; RowKey = 'window-0'; State = 'Processing'; SearchId = 'search-0'; Timestamp = [datetimeoffset]::UtcNow.AddHours(-3) }
+            }
+            $null = Push-AuditLogDownloadV2 -Item @{ TenantFilter = 'contoso.com' }
+            Should -Invoke Start-CIPPOrchestrator -Times 1 -Exactly
         }
     }
 }

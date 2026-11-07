@@ -13,7 +13,7 @@ function Get-CIPPIntuneTemplateType {
         The template's recorded Type, if any.
 
     .PARAMETER RawJson
-        The raw policy JSON to infer from when Type is empty.
+        The policy to infer from when Type is empty, as a JSON string or an already parsed object.
 
     .EXAMPLE
         Get-CIPPIntuneTemplateType -Type $Template.Type -RawJson $Template.RAWJson
@@ -30,12 +30,18 @@ function Get-CIPPIntuneTemplateType {
     }
 
     try {
-        $ParsedRaw = $RawJson | ConvertFrom-Json -ErrorAction SilentlyContinue
+        $ParsedRaw = if ($RawJson -is [string]) {
+            $RawJson | ConvertFrom-Json -ErrorAction SilentlyContinue
+        } else {
+            $RawJson
+        }
         $ODataType = $ParsedRaw.'@odata.type'
 
         if ($null -ne $ParsedRaw.settings -and $null -ne $ParsedRaw.technologies) { return 'Catalog' }
         if ($null -ne $ParsedRaw.scheduledActionsForRule -or $ODataType -match 'CompliancePolicy') { return 'deviceCompliancePolicies' }
         if ($ODataType -match 'windowsDriverUpdateProfile') { return 'windowsDriverUpdateProfiles' }
+        # BIOS configuration profiles carry no @odata.type; the format property is unique to them.
+        if ($null -ne $ParsedRaw.hardwareConfigurationFormat -or $ODataType -match 'hardwareConfiguration') { return 'hardwareConfigurations' }
         if ($ODataType -match 'ManagedApp|managedAppProtection') { return 'AppProtection' }
         if ($ODataType -match 'deviceConfiguration|#microsoft\.graph\.\w+Configuration$') { return 'Device' }
     } catch {

@@ -7,15 +7,19 @@ function Invoke-AddOfficeApp {
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
-    $AllowedTenants = Test-CIPPAccess -Request $Request -TenantList
-    $Tenants = ($Request.Body.selectedTenants | Where-Object { $AllowedTenants -contains $_.customerId -or $AllowedTenants -contains 'AllTenants' }).defaultDomainName
+    $Tenants = (Resolve-CippBulkSelectedTenant -Request $Request -SelectedTenants $Request.Body.selectedTenants).defaultDomainName
     # Input bindings are passed in via param block.
     $Headers = $Request.Headers
     $APIName = $Request.Params.CIPPEndpoint
     if ('AllTenants' -in $Tenants) { $Tenants = (Get-Tenants).defaultDomainName }
     $AssignTo = $Request.Body.AssignTo -eq 'customGroup' ? $Request.Body.CustomGroup : $Request.Body.AssignTo
     $ExcludeGroup = $Request.Body.excludeGroup
+    # Group ids from the deploy drawer's single-tenant picker. CustomGroup/excludeGroup still
+    # carry the display names for logging and as a fallback if the ids are ever dropped.
+    $GroupIds = @($Request.Body.GroupIds | Where-Object { $_ })
+    $ExcludeGroupIds = @($Request.Body.ExcludeGroupIds | Where-Object { $_ })
 
+    $Failed = 0
     $Results = foreach ($Tenant in $Tenants) {
         try {
             # Office is a singleton per tenant, so match on the type rather than on a display name
@@ -34,11 +38,23 @@ function Invoke-AddOfficeApp {
             }
             Write-LogMessage -headers $Headers -API $APIName -tenant $($Tenant) -message "Added Office profile to $($Tenant)" -Sev 'Info'
             if ($AssignTo -and $AssignTo -ne 'On') {
-                Set-CIPPAssignedApplication -ApplicationId $OfficeAppID.id -TenantFilter $Tenant -Intent 'Required' -GroupName $AssignTo -ExcludeGroup $ExcludeGroup -APIName $APIName -Headers $Headers
+                $AssignParams = @{
+                    ApplicationId = $OfficeAppID.id
+                    TenantFilter  = $Tenant
+                    Intent        = 'Required'
+                    GroupName     = $AssignTo
+                    ExcludeGroup  = $ExcludeGroup
+                    APIName       = $APIName
+                    Headers       = $Headers
+                }
+                if ($GroupIds.Count -gt 0) { $AssignParams.GroupIds = $GroupIds }
+                if ($ExcludeGroupIds.Count -gt 0) { $AssignParams.ExcludeGroupIds = $ExcludeGroupIds }
+                Set-CIPPAssignedApplication @AssignParams
                 Write-LogMessage -headers $Headers -API $APIName -tenant $($Tenant) -message "Assigned Office to $AssignTo" -Sev 'Info'
             }
             "Successfully added Office App for $($Tenant)"
         } catch {
+            $Failed++
             $ErrorMessage = Get-CippException -Exception $_
             "Failed to add Office App for $($Tenant): $($ErrorMessage.NormalizedError)"
             Write-LogMessage -headers $Headers -API $APIName -tenant $($Tenant) -message "Failed to add Office App. Error: $($ErrorMessage.NormalizedError)" -Sev 'Error' -Logdata $ErrorMessage
@@ -48,7 +64,7 @@ function Invoke-AddOfficeApp {
     }
 
     return ([HttpResponseContext]@{
-            StatusCode = [HttpStatusCode]::OK
+            StatusCode = Get-CippBulkStatusCode -Total @($Tenants).Count -Failed $Failed
             Body       = @{'Results' = $Results }
         })
 }

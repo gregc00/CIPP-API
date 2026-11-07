@@ -39,6 +39,7 @@ function New-CIPPUserTask {
                         Webhook = [bool]$Request.Body.PostExecution.webhook
                         Email   = [bool]$Request.Body.PostExecution.email
                         PSA     = [bool]$Request.Body.PostExecution.psa
+                        Push    = [bool]$Request.Body.PostExecution.push
                     }
                 }
                 Add-CIPPScheduledTask -Task $taskObject -hidden $false -Headers $Headers
@@ -63,7 +64,7 @@ function New-CIPPUserTask {
     }
     if ($UserObj.copyFrom.value) {
         Write-Host "Copying from $($UserObj.copyFrom.value)"
-        $CopyFrom = Set-CIPPCopyGroupMembers -Headers $Headers -CopyFromId $UserObj.copyFrom.value -UserID $CreationResults.Username -TenantFilter $UserObj.tenantFilter
+        $CopyFrom = Set-CIPPCopyGroupMembers -Headers $Headers -CopyFromId $UserObj.copyFrom.value -UserID $CreationResults.Username -TenantFilter $UserObj.tenantFilter -DeferExchange
         $CopyFrom.Success | ForEach-Object { $Results.Add($_) }
         $CopyFrom.Error | ForEach-Object { $Results.Add($_) }
         # Groups deliberately left out (dynamic, AD-synced, public, already assigned) are reported
@@ -71,45 +72,66 @@ function New-CIPPUserTask {
         $CopyFrom.Skipped | ForEach-Object { $Results.Add($_) }
     }
 
-    # Add to groups
+    # Add to groups. Exchange-backed groups are always scheduled: a brand-new user is not an Exchange
+    # recipient yet, so an inline Add-DistributionGroupMember would fail. Graph groups are added inline,
+    # and scheduled too if the new user cannot be found yet.
     if ($UserObj.AddToGroups) {
-        $ExoGroupTypes = @('Distribution list', 'Mail-Enabled Security')
-        $UserObj.AddToGroups | ForEach-Object {
-            $Group = $_
+        foreach ($Group in @($UserObj.AddToGroups)) {
             $GroupType = $Group.addedFields.groupType
+            $GroupLabel = $Group.label ?? $Group.value
             try {
-                $AddMemberResult = Add-CIPPGroupMember -Headers $Headers -GroupType $GroupType -GroupId $Group.value -Member @($CreationResults.Username) -TenantFilter $UserObj.tenantFilter
-                $Results.Add($AddMemberResult)
-            } catch {
-                # EXO group adds frequently fail right after user creation due to Exchange directory replication lag.
-                # Schedule a delayed retry so the user lands in the group automatically once EXO sees the recipient.
-                # Groups selected from a template often carry no type at all (older templates stored only a label
-                # and a value), and an untyped group is just as likely to be a distribution list as anything else,
-                # so treat unknown the same as Exchange rather than failing the onboarding outright.
-                if (-not $GroupType -or $GroupType -in $ExoGroupTypes) {
-                    try {
-                        $TaskBody = [PSCustomObject]@{
-                            TenantFilter  = $UserObj.tenantFilter
-                            Name          = "Retry Add Group Member: $($CreationResults.Username) -> $($Group.label)"
-                            Command       = @{ value = 'Add-CIPPGroupMember' }
-                            Parameters    = [PSCustomObject]@{
-                                GroupType    = $GroupType
-                                GroupId      = $Group.value
-                                Member       = @($CreationResults.Username)
-                                TenantFilter = $UserObj.tenantFilter
-                                APIName      = 'Add Group Member (Retry)'
-                            }
-                            ScheduledTime = [int64](([datetime]::UtcNow).AddMinutes(15) - (Get-Date '1/1/1970')).TotalSeconds
-                            PostExecution = @{ Webhook = $false; Email = $false; PSA = $false }
-                        }
-                        $null = Add-CIPPScheduledTask -Task $TaskBody -hidden $false -Headers $Headers -DisallowDuplicateName $true
-                        $Results.Add("Could not add $($CreationResults.Username) to $($Group.label) yet (Exchange replication delay). A retry has been scheduled in 15 minutes.")
-                    } catch {
-                        $Results.Add("Failed to add to group $($Group.label): $_")
-                    }
-                } else {
-                    $Results.Add("Failed to add to group $($Group.label): $_")
+                # The live group wins; saved option types can be missing, stale or in another vocabulary.
+                # No fallback here so an unresolved group is detectable and the option fields decide.
+                $Lookup = Get-CIPPGroupType -GroupId $Group.value -TenantFilter $UserObj.tenantFilter
+                $ResolvedType = if ($Lookup.IsExchangeBacked -or $null -ne $Lookup.GroupObject.mailEnabled -or $null -ne $Lookup.GroupObject.securityEnabled) { $Lookup.GroupType }
+                $IsExchangeGroup = Test-CIPPGroupIsExchangeBacked -AddedFields $Group.addedFields -ResolvedType $ResolvedType
+                # Nothing known about the group: scheduling is the safe default, an inline Exchange add always fails.
+                if (-not $ResolvedType -and -not $Group.addedFields.calculatedGroupType -and -not $Group.addedFields.groupType) {
+                    $IsExchangeGroup = $true
                 }
+
+                $Reason = 'once Exchange has provisioned the mailbox'
+                if (-not $IsExchangeGroup) {
+                    $AddMemberResult = $null
+                    # The new account may not have replicated to every directory replica yet.
+                    for ($Attempt = 1; $Attempt -le 3 -and -not $AddMemberResult; $Attempt++) {
+                        try {
+                            $AddMemberResult = Add-CIPPGroupMember -Headers $Headers -GroupType ($ResolvedType ?? $GroupType) -GroupId $Group.value -Member @($CreationResults.Username) -TenantFilter $UserObj.tenantFilter
+                        } catch {
+                            if ("$_" -notmatch 'not found|does not exist') { throw }
+                            if ($Attempt -lt 3) { Start-Sleep -Seconds 3 }
+                        }
+                    }
+                    if ($AddMemberResult) {
+                        $Results.Add($AddMemberResult)
+                        continue
+                    }
+                    $Reason = 'once the new account has replicated'
+                }
+
+                $TaskBody = [PSCustomObject]@{
+                    TenantFilter  = $UserObj.tenantFilter
+                    Name          = "Add Group Member: $($CreationResults.Username) -> $GroupLabel"
+                    Command       = @{ value = 'Add-CIPPGroupMember' }
+                    Parameters    = [PSCustomObject]@{
+                        # Add-CIPPGroupMember only uses this to route to Exchange if its own lookup fails.
+                        GroupType    = $ResolvedType ?? ($IsExchangeGroup ? 'Distribution List' : $GroupType)
+                        GroupId      = $Group.value
+                        Member       = @($CreationResults.Username)
+                        TenantFilter = $UserObj.tenantFilter
+                        APIName      = 'Add Group Member (Onboarding)'
+                    }
+                    ScheduledTime = [int64](([datetime]::UtcNow).AddMinutes(15) - (Get-Date '1/1/1970')).TotalSeconds
+                    PostExecution = @{ Webhook = $false; Email = $false; PSA = $false }
+                }
+                $ScheduleResult = Add-CIPPScheduledTask -Task $TaskBody -hidden $false -Headers $Headers -DisallowDuplicateName $true
+                if ($ScheduleResult -like 'Successfully added task:*') {
+                    $Results.Add("Scheduled adding $($CreationResults.Username) to $GroupLabel in 15 minutes, $Reason.")
+                } else {
+                    $Results.Add("Failed to schedule adding to group $($GroupLabel): $ScheduleResult")
+                }
+            } catch {
+                $Results.Add("Failed to add to group $($GroupLabel): $_")
             }
         }
     }
@@ -164,13 +186,23 @@ function New-CIPPUserTask {
             # task per level. They are separate Exchange operations anyway.
             $MailboxPermissions = @(@($UserObj.sharedMailboxPermission) | ForEach-Object { if ($_.value) { $_.value } else { $_ } } | Where-Object { $_ })
             if (-not $MailboxPermissions) { $MailboxPermissions = @('FullAccess') }
+            # FullAccessNoAutoMap is Full Access granted with automapping off. A grant carries one
+            # automapping flag, so when both variants are selected the explicit no-automapping wins.
+            if ($MailboxPermissions -contains 'FullAccessNoAutoMap') {
+                $MailboxPermissions = @($MailboxPermissions | Where-Object { $_ -ne 'FullAccess' })
+            }
             foreach ($Mailbox in @($UserObj.sharedMailboxes)) {
                 $MailboxId = if ($Mailbox.value) { $Mailbox.value } else { $Mailbox }
                 $MailboxLabel = if ($Mailbox.label) { $Mailbox.label } else { $MailboxId }
                 foreach ($MailboxPermission in $MailboxPermissions) {
+                    $PermissionLevel = if ($MailboxPermission -eq 'FullAccessNoAutoMap') { 'FullAccess' } else { $MailboxPermission }
+                    $AutoMap = $MailboxPermission -ne 'FullAccessNoAutoMap'
                     # AutoMap only applies to FullAccess, and is what makes Outlook mount the mailbox
                     # on its own, so no invitation is needed on this side of the feature.
-                    $AutoMapNote = if ($MailboxPermission -eq 'FullAccess') { ' Outlook adds the mailbox automatically.' } else { '' }
+                    $AutoMapNote = if ($PermissionLevel -ne 'FullAccess') { '' }
+                    elseif ($AutoMap) { ' Outlook adds the mailbox automatically.' }
+                    else { ' Automapping is off, so the user adds the mailbox to Outlook themselves.' }
+                    $PermissionDisplay = if ($AutoMap) { $PermissionLevel } else { 'FullAccess (no automapping)' }
                     $SharedAccessGrants.Add([PSCustomObject]@{
                             Identity   = $MailboxId
                             Kind       = 'mailbox'
@@ -181,12 +213,12 @@ function New-CIPPUserTask {
                                 TenantFilter    = $UserObj.tenantFilter
                                 UserId          = $MailboxId
                                 AccessUser      = $CreationResults.Username
-                                PermissionLevel = $MailboxPermission
+                                PermissionLevel = $PermissionLevel
                                 Action          = 'Add'
-                                AutoMap         = $true
+                                AutoMap         = $AutoMap
                                 APIName         = 'Shared Mailbox Onboarding'
                             }
-                            Success    = "Scheduled $MailboxPermission on the shared mailbox $MailboxLabel in 15 minutes.$AutoMapNote"
+                            Success    = "Scheduled $PermissionDisplay on the shared mailbox $MailboxLabel in 15 minutes.$AutoMapNote"
                         })
                 }
             }
@@ -220,6 +252,42 @@ function New-CIPPUserTask {
         }
     }
 
+    # SharePoint site membership is scheduled instead of run inline: a freshly created account cannot
+    # be resolved on a site (ensureuser) until it has replicated to SharePoint.
+    if ($UserObj.sharePointSites) {
+        $SiteRole = $UserObj.sharePointSiteRole.value ?? $UserObj.sharePointSiteRole ?? 'Members'
+        $SiteAccessTime = [int64](([datetime]::UtcNow).AddMinutes(15) - (Get-Date '1/1/1970')).TotalSeconds
+        foreach ($Site in @($UserObj.sharePointSites)) {
+            $SiteLabel = $Site.label ?? $Site.value
+            try {
+                $TaskBody = [PSCustomObject]@{
+                    TenantFilter  = $UserObj.tenantFilter
+                    Name          = "Add SharePoint Site Member: $($CreationResults.Username) -> $($Site.value) ($SiteRole)"
+                    Command       = @{ value = 'Set-CIPPSharePointSiteMember' }
+                    Parameters    = [PSCustomObject]@{
+                        TenantFilter      = $UserObj.tenantFilter
+                        UserPrincipalName = $CreationResults.Username
+                        Role              = $SiteRole
+                        SharePointType    = $Site.addedFields.rootWebTemplate
+                        GroupId           = $Site.addedFields.ownerPrincipalName
+                        SiteUrl           = $Site.value
+                        APIName           = 'SharePoint Site Onboarding'
+                    }
+                    ScheduledTime = $SiteAccessTime
+                    PostExecution = @{ Webhook = $false; Email = $false; PSA = $false }
+                }
+                $ScheduleResult = Add-CIPPScheduledTask -Task $TaskBody -hidden $false -Headers $Headers -DisallowDuplicateName $true
+                if ($ScheduleResult -like 'Successfully added task:*') {
+                    $Results.Add("Scheduled $SiteRole access to the SharePoint site $SiteLabel in 15 minutes.")
+                } else {
+                    $Results.Add("Failed to schedule SharePoint access to $($SiteLabel): $ScheduleResult")
+                }
+            } catch {
+                $Results.Add("Failed to schedule SharePoint access to $($SiteLabel): $($_.Exception.Message)")
+            }
+        }
+    }
+
     if ($UserObj.setManager) {
         $ManagerResults = Set-CIPPManager -Users $CreationResults.Username -Manager $UserObj.setManager.value -TenantFilter $UserObj.tenantFilter -Headers $Headers
         $Results.Add($ManagerResults.Result)
@@ -228,6 +296,16 @@ function New-CIPPUserTask {
     if ($UserObj.setSponsor) {
         $SponsorResults = Set-CIPPSponsor -Users $CreationResults.Username -Sponsor $UserObj.setSponsor.value -TenantFilter $UserObj.tenantFilter -Headers $Headers
         $Results.Add($SponsorResults.Result)
+    }
+
+    try {
+        if ($UserObj.perUserMfa -eq $true) {
+            $MfaResult = Set-CIPPPerUserMFA -TenantFilter $UserObj.tenantFilter -userId $CreationResults.Username -State 'enforced' -Headers $Headers -APIName $APIName
+            $Results.Add($MfaResult)
+        }
+    } catch {
+        Write-LogMessage -headers $Headers -API $APIName -tenant $($UserObj.tenantFilter) -message "Failed to set per-user MFA. Error:$($_.Exception.Message)" -Sev 'Error'
+        $Results.Add("Failed to set per-user MFA: $($_.Exception.Message)")
     }
 
     return @{

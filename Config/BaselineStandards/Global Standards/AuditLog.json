@@ -15,7 +15,6 @@
   "powershellEquivalent": "Enable-OrganizationCustomization",
   "appliesToTest": [
     "CISAMSEXO171",
-    "CISAMSEXO173",
     "CIS_3_1_1"
   ],
   "recommendedBy": [
@@ -29,7 +28,7 @@
     "EXCHANGE_S_ENTERPRISE_GOV",
     "EXCHANGE_LITE"
   ],
-  "secureScoreImpact": 0,
+  "secureScoreImpact": 3,
   "compare": "subset",
   "variables": {
     "enabled": {

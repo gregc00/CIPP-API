@@ -5,12 +5,13 @@ Function Invoke-ExecExtensionTest {
     .ROLE
         CIPP.Extension.Read
     .DESCRIPTION
-        Tests the stored credentials for a configured third-party integration and reports whether CIPP can connect. extensionName selects which one: HaloPSA, Gradient, NinjaOne, PWPush, Hudu, Sherweb, HIBP or GitHub.
+        Tests the stored credentials for a configured third-party integration and reports whether CIPP can connect. extensionName selects which one: HaloPSA, Syncro, Gradient, NinjaOne, PWPush, Hudu, Sherweb, HIBP or GitHub.
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
     $Table = Get-CIPPTable -TableName Extensionsconfig
     $Configuration = ((Get-CIPPAzDataTableEntity @Table).config | ConvertFrom-Json)
+    $StatusCode = [HttpStatusCode]::OK
     # Interact with query parameters or the body of the request.
     try {
         switch ($Request.Query.extensionName) {
@@ -19,7 +20,29 @@ Function Invoke-ExecExtensionTest {
                 if ($token) {
                     $Results = [pscustomobject]@{'Results' = 'Successfully Connected to HaloPSA' }
                 } else {
+                    $StatusCode = [HttpStatusCode]::InternalServerError
                     $Results = [pscustomobject]@{'Results' = 'Failed to connect to HaloPSA, check your API credentials and try again.' }
+                }
+            }
+            'Syncro' {
+                # /me answers with the API key's own user and permissions, so the test can say
+                # up front whether that user may read customers and write tickets - the two
+                # things the integration needs - instead of failing on the first alert.
+                $Me = Invoke-SyncroRequest -Configuration $Configuration.Syncro -Endpoint '/me'
+                if ($Me.user_name -or $Me.user_email) {
+                    $Missing = [System.Collections.Generic.List[string]]::new()
+                    if ($Me.permissions.customer -and -not $Me.permissions.customer.read) { $Missing.Add('read customers') }
+                    if ($Me.permissions.ticket -and -not $Me.permissions.ticket.write) { $Missing.Add('create tickets') }
+                    $Who = if ($Me.user_name) { $Me.user_name } else { $Me.user_email }
+                    if ($Missing.Count -gt 0) {
+                        $StatusCode = [HttpStatusCode]::InternalServerError
+                        $Results = [pscustomobject]@{'Results' = "Connected to Syncro as $Who, but that user cannot $($Missing -join ' or '). Use an API key from a user with customer read and ticket write permissions." }
+                    } else {
+                        $Results = [pscustomobject]@{'Results' = "Successfully Connected to Syncro as $Who ($($Me.subdomain).syncromsp.com)" }
+                    }
+                } else {
+                    $StatusCode = [HttpStatusCode]::InternalServerError
+                    $Results = [pscustomobject]@{'Results' = 'Failed to connect to Syncro, check your subdomain and API key and try again.' }
                 }
             }
             'Gradient' {
@@ -32,9 +55,11 @@ Function Invoke-ExecExtensionTest {
                         }
                         $Results = [pscustomobject]@{'Results' = 'Successfully Connected to Gradient' }
                     } catch {
+                        $StatusCode = [HttpStatusCode]::InternalServerError
                         $Results = [pscustomobject]@{'Results' = 'Failed to connect to Gradient, check your API credentials and try again.' }
                     }
                 } else {
+                    $StatusCode = [HttpStatusCode]::InternalServerError
                     $Results = [pscustomobject]@{'Results' = 'Failed to connect to Gradient, check your API credentials and try again.' }
                 }
             }
@@ -46,25 +71,42 @@ Function Invoke-ExecExtensionTest {
                 if ($token) {
                     $Results = [pscustomobject]@{'Results' = 'Successfully Connected to NinjaOne' }
                 } else {
+                    $StatusCode = [HttpStatusCode]::InternalServerError
                     $Results = [pscustomobject]@{'Results' = 'Failed to connect to NinjaOne, check your API credentials and try again.' }
                 }
             }
             'PWPush' {
+                if ($Configuration.PWPush.Enabled -ne $true) {
+                    $Results = [pscustomobject]@{'Results' = 'PWPush is not enabled. Enable the integration and save the configuration, then test again.' }
+                    break
+                }
                 $Payload = 'This is a test from CIPP'
-                $PasswordLink = New-PwPushLink -Payload $Payload
+                # ThrowOnError: the silent $false fallback exists for the password flows; the
+                # test's whole job is to show why a push fails, so let the real exception through.
+                try {
+                    $PasswordLink = New-PwPushLink -Payload $Payload -ThrowOnError
+                } catch {
+                    $StatusCode = [HttpStatusCode]::InternalServerError
+                    $Results = [pscustomobject]@{'Results' = "PWPush is enabled but creating a test push failed: $($_.Exception.Message)" }
+                    break
+                }
                 if ($PasswordLink) {
                     $Results = [pscustomobject]@{Results = @(@{'resultText' = 'Successfully generated PWPush, hit the Copy to Clipboard button to retrieve the test.'; 'copyField' = $PasswordLink; 'state' = 'success' }) }
                 } else {
-                    $Results = [pscustomobject]@{'Results' = 'PWPush is not enabled' }
+                    $StatusCode = [HttpStatusCode]::InternalServerError
+                    $Results = [pscustomobject]@{'Results' = 'PWPush did not return a link. Check the CIPP logbook (API: PwPush) for details.' }
                 }
             }
             'Hudu' {
                 Connect-HuduAPI -configuration $Configuration
-                $Version = Get-HuduAppInfo
-                if ($Version.version) {
+                $HuduInfoErrors = $null
+                $Version = Get-HuduAppInfo -ErrorAction SilentlyContinue -ErrorVariable HuduInfoErrors 3>$null
+                if ($Version.version -and $Version.version -ne '0.0.0.0') {
                     $Results = [pscustomobject]@{'Results' = ('Successfully Connected to Hudu, version: {0}' -f $Version.version) }
                 } else {
-                    $Results = [pscustomobject]@{'Results' = 'Failed to connect to Hudu, check your API credentials and try again.' }
+                    $Reason = (@($HuduInfoErrors) | ForEach-Object { "$_" } | Where-Object { $_ } | Select-Object -Last 1) -replace '\s+', ' '
+                    $StatusCode = [HttpStatusCode]::InternalServerError
+                    $Results = [pscustomobject]@{'Results' = "Failed to connect to Hudu, check your API credentials and try again.$(if ($Reason) { " Error: $Reason" })" }
                 }
             }
             'Sherweb' {
@@ -72,6 +114,7 @@ Function Invoke-ExecExtensionTest {
                 if ($token) {
                     $Results = [pscustomobject]@{'Results' = 'Successfully Connected to Sherweb' }
                 } else {
+                    $StatusCode = [HttpStatusCode]::InternalServerError
                     $Results = [pscustomobject]@{'Results' = 'Failed to connect to Sherweb, check your API credentials and try again.' }
                 }
             }
@@ -80,7 +123,15 @@ Function Invoke-ExecExtensionTest {
                 $Results = [pscustomobject]@{'Results' = 'Successfully Connected to HIBP' }
             }
             'GitHub' {
-                $GitHubResponse = Invoke-GitHubApiRequest -Method 'GET' -Path 'user' -ReturnHeaders
+                # NoFallback: the test must judge the configured token itself - the anonymous
+                # function-app fallback would turn a rejected PAT into a false success.
+                try {
+                    $GitHubResponse = Invoke-GitHubApiRequest -Method 'GET' -Path 'user' -ReturnHeaders -NoFallback
+                } catch {
+                    $StatusCode = [HttpStatusCode]::InternalServerError
+                    $Results = [pscustomobject]@{ 'Results' = "GitHub rejected the configured API token: $($_.Exception.Message). Check that the API key is valid and has not expired, then try again." }
+                    break
+                }
                 if ($GitHubResponse.login) {
                     if ($GitHubResponse.Headers.'x-oauth-scopes') {
                         $Results = [pscustomobject]@{ 'Results' = "Successfully connected to GitHub user: $($GitHubResponse.login) with scopes: $($GitHubResponse.Headers.'x-oauth-scopes')" }
@@ -88,16 +139,18 @@ Function Invoke-ExecExtensionTest {
                         $Results = [pscustomobject]@{ 'Results' = "Successfully connected to GitHub user: $($GitHubResponse.login) using a Fine Grained PAT" }
                     }
                 } else {
+                    $StatusCode = [HttpStatusCode]::InternalServerError
                     $Results = [pscustomobject]@{ 'Results' = 'Failed to connect to GitHub. Check your API credentials and try again.' }
                 }
             }
         }
     } catch {
+        $StatusCode = [HttpStatusCode]::InternalServerError
         $Results = [pscustomobject]@{'Results' = "Failed to connect: $($_.Exception.Message). Line $($_.InvocationInfo.ScriptLineNumber)" }
     }
 
     return ([HttpResponseContext]@{
-            StatusCode = [HttpStatusCode]::OK
+            StatusCode = $StatusCode
             Body       = $Results
         })
 

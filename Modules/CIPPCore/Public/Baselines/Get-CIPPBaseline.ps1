@@ -32,33 +32,46 @@ function Get-CIPPBaseline {
     $RolloutRows = Get-CIPPAzDataTableEntity @RolloutTable -Filter $Filter
     if (-not $RolloutRows) { return }
 
+    $RepoTable = Get-CippTable -tablename 'CommunityRepos'
+    $Repos = @(Get-CIPPAzDataTableEntity @RepoTable -Filter "PartitionKey eq 'CommunityRepos'")
+
     $DeltaTable = Get-CippTable -tablename 'Baselines'
     $StateTable = Get-CippTable -tablename 'BaselineRolloutState'
 
-    # Identity-carrying standards (CA/Intune templates) store the raw template id in
-    # their variables; the editor's pickers and instance titles need the template's
-    # display name. Resolve lazily from the template store (partition = the remediate
-    # executor name) and hand the variable back as a {label, value} option object -
-    # the editor consumes it verbatim and unwraps back to the raw id on save.
+    $AllDefinitions = @()
+    try { $AllDefinitions = @(Get-CIPPBaselineDefinition) } catch { Write-Information "Get-CIPPBaseline: definition lookup failed: $($_.Exception.Message)" }
+    $MultiIdentityVariables = @{}
+    foreach ($Definition in $AllDefinitions) {
+        if ($Definition.multiple -eq $true -and $Definition.instanceIdentity) {
+            $MultiIdentityVariables[$Definition.name] = "$($Definition.instanceIdentity)"
+        }
+    }
     $IdentityDefinitions = @{}
     if ($ResolveIdentityLabels) {
-        foreach ($Definition in @(Get-CIPPBaselineDefinition)) {
-            if ($Definition.instanceIdentity) {
-                $IdentityDefinitions[$Definition.name] = @{ Variable = $Definition.instanceIdentity; Partition = "$($Definition.remediate.executor)" }
+        foreach ($Definition in $AllDefinitions) {
+            $IdentityType = "$($Definition.variables.$($Definition.instanceIdentity).type)"
+            if ($Definition.instanceIdentity -and $IdentityType -in @('autoComplete', 'select')) {
+                $IdentityDefinitions[$Definition.name] = @{
+                    Variable  = $Definition.instanceIdentity
+                    Partition = "$($Definition.identity.partition ?? $Definition.remediate.executor)"
+                    NameField = "$($Definition.identity.nameField ?? 'displayName')"
+                }
             }
         }
     }
     $TemplateNameMaps = @{}
     $ResolveTemplateName = {
-        param($Partition, $Id)
+        param($Partition, $Id, $NameField)
         if (-not $Partition -or -not $Id) { return $null }
-        if (-not $TemplateNameMaps.ContainsKey($Partition)) {
+        if ([string]::IsNullOrWhiteSpace($NameField)) { $NameField = 'displayName' }
+        $MapKey = "$Partition|$NameField"
+        if (-not $TemplateNameMaps.ContainsKey($MapKey)) {
             $Map = @{}
             try {
                 $TemplatesTable = Get-CippTable -tablename 'templates'
                 $SafePartition = ConvertTo-CIPPODataFilterValue -Value $Partition
                 foreach ($TemplateRow in @(Get-CIPPAzDataTableEntity @TemplatesTable -Filter "PartitionKey eq '$SafePartition'")) {
-                    $TemplateName = $(try { ($TemplateRow.JSON | ConvertFrom-Json).displayName } catch { $null })
+                    $TemplateName = $(try { ($TemplateRow.JSON | ConvertFrom-Json).$NameField } catch { $null })
                     if ($TemplateName) {
                         $Map["$($TemplateRow.RowKey)"] = $TemplateName
                         if ($TemplateRow.GUID) { $Map["$($TemplateRow.GUID)"] = $TemplateName }
@@ -67,9 +80,9 @@ function Get-CIPPBaseline {
             } catch {
                 Write-Information "Get-CIPPBaseline: template name lookup for $Partition failed: $($_.Exception.Message)"
             }
-            $TemplateNameMaps[$Partition] = $Map
+            $TemplateNameMaps[$MapKey] = $Map
         }
-        $TemplateNameMaps[$Partition]["$Id"]
+        $TemplateNameMaps[$MapKey]["$Id"]
     }
     $EnrichIdentityVariable = {
         param($InstanceKey, $Variables)
@@ -77,13 +90,56 @@ function Get-CIPPBaseline {
         $Identity = $IdentityDefinitions[(($InstanceKey) -split '#')[0]]
         if ($Identity -and $Variables.PSObject.Properties[$Identity.Variable]) {
             $RawId = $Variables.$($Identity.Variable)
-            if ($RawId -is [System.Management.Automation.PSCustomObject]) { $RawId = $RawId.value }
+            $RawId = $RawId.value ?? $RawId
             if ($RawId) {
-                $Label = (& $ResolveTemplateName $Identity.Partition "$RawId") ?? "$RawId"
+                $Label = (& $ResolveTemplateName $Identity.Partition "$RawId" $Identity.NameField) ?? "$RawId"
                 $Variables.$($Identity.Variable) = [PSCustomObject]@{ label = $Label; value = "$RawId" }
             }
         }
         $Variables
+    }
+
+
+    $InstanceId = {
+        param($Seed)
+        $Hash = [System.Security.Cryptography.SHA256]::HashData([System.Text.Encoding]::UTF8.GetBytes("$Seed"))
+        ([System.Convert]::ToHexString($Hash)).Substring(0, 8).ToLower()
+    }
+
+
+    $ExpandDeltaConfigs = {
+        param($Delta)
+        $BaseName = (($Delta.standardName) -split '#')[0]
+        $Variables = $(try { $Delta.expectedValue | ConvertFrom-Json } catch { [PSCustomObject]@{} }) ?? [PSCustomObject]@{}
+        $IdentityVariable = $MultiIdentityVariables[$BaseName]
+        $NewConfig = {
+            param($InstanceKey, $ConfigVariables)
+            [PSCustomObject]@{
+                standard         = $BaseName
+                instance         = "$InstanceKey"
+                variables        = (& $EnrichIdentityVariable $InstanceKey $ConfigVariables)
+                remediateEnabled = [bool]$Delta.remediateEnabled
+                alertEnabled     = [bool]$Delta.alertEnabled
+                alertOnRemediate = [bool]$Delta.alertOnRemediate
+            }
+        }
+        # Plain assignment, not an if-EXPRESSION: collecting pipeline output unrolls a
+        # single-element array to its bare value, which would read as 'already upgraded'.
+        $RawIdentity = $null
+        if ($IdentityVariable) { $RawIdentity = $Variables.$IdentityVariable }
+        if ($RawIdentity -is [array]) {
+            $IdentityValues = @($RawIdentity | ForEach-Object { "$($_.value ?? $_)" } | Where-Object { $_ } | Select-Object -Unique)
+            if ($IdentityValues.Count -gt 0) {
+                $FannedOut = foreach ($IdentityValue in $IdentityValues) {
+                    $InstanceVariables = [ordered]@{}
+                    foreach ($Property in $Variables.PSObject.Properties) { $InstanceVariables[$Property.Name] = $Property.Value }
+                    $InstanceVariables[$IdentityVariable] = $IdentityValue
+                    & $NewConfig ('{0}#m{1}' -f $BaseName, (& $InstanceId $IdentityValue)) ([PSCustomObject]$InstanceVariables)
+                }
+                return [PSCustomObject]@{ Configs = @($FannedOut); FannedOut = $true }
+            }
+        }
+        [PSCustomObject]@{ Configs = @((& $NewConfig $Delta.standardName $Variables)); FannedOut = $false }
     }
 
     # Tenant + group context for assignment expansion and display names.
@@ -95,6 +151,8 @@ function Get-CIPPBaseline {
     foreach ($Tenant in $AllTenants) {
         if ($Tenant.defaultDomainName) { $TenantNames[$Tenant.defaultDomainName] = $Tenant.displayName }
     }
+    # Stored tenant values are customerIds, or domains on older saves: both read as the current default domain.
+    $TenantLookup = Get-CIPPTenantLookup -Tenants $AllTenants
 
     foreach ($RolloutRow in $RolloutRows) {
         # One corrupted baseline must never take down the whole list: log and show the rest.
@@ -103,6 +161,13 @@ function Get-CIPPBaseline {
             $StageDefinitions = @($RolloutRow.Stages | ConvertFrom-Json -ErrorAction Stop)
             $ExcludedTenants = @()
             try { if ($RolloutRow.excludedTenants) { $ExcludedTenants = @($RolloutRow.excludedTenants | ConvertFrom-Json) } } catch { }
+            # Expand a stored group Id to its member domains, same as assignment scopes. Raw
+            # values (including group Ids) stay in $ExcludedTenants for the exclusions display.
+            $ExpandedExcludedTenants = @($ExcludedTenants | ForEach-Object {
+                    $Value = $_
+                    $Group = $Groups | Where-Object { $_.Id -eq $Value } | Select-Object -First 1
+                    if ($Group) { $Group.Members.defaultDomainName } else { $TenantLookup["$Value"].defaultDomainName ?? $Value }
+                } | Select-Object -Unique)
 
             # The standards per stage come from the delta rows for this baseline.
             $SafeGuid = ConvertTo-CIPPODataFilterValue -Value $GUID
@@ -114,21 +179,22 @@ function Get-CIPPBaseline {
                 $CurrentNumber = $StageNumber
                 # One delta exists per scope; a stage's standards are the unique instance keys.
                 $StageDeltas = @($Deltas | Where-Object { [int]$_.stage -eq $CurrentNumber } | Sort-Object -Property standardName -Unique)
+
+                $Expansions = @($StageDeltas | ForEach-Object { & $ExpandDeltaConfigs $_ })
+                $StageConfigs = [System.Collections.Generic.List[object]]::new()
+                $SeenInstances = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                foreach ($Expansion in @($Expansions | Where-Object { -not $_.FannedOut }) + @($Expansions | Where-Object { $_.FannedOut })) {
+                    foreach ($Config in $Expansion.Configs) {
+                        if ($SeenInstances.Add("$($Config.instance)")) { $StageConfigs.Add($Config) }
+                    }
+                }
                 [PSCustomObject]@{
                     name            = $StageDefinition.name
                     logic           = $StageDefinition.logic
-                    conditions      = @($StageDefinition.conditions)
-                    standards       = @($StageDeltas.standardName)
-                    standardsConfig = @($StageDeltas | ForEach-Object {
-                            [PSCustomObject]@{
-                                standard         = (($_.standardName) -split '#')[0]
-                                instance         = $_.standardName
-                                variables        = (& $EnrichIdentityVariable $_.standardName $(try { $_.expectedValue | ConvertFrom-Json } catch { [PSCustomObject]@{} }))
-                                remediateEnabled = [bool]$_.remediateEnabled
-                                alertEnabled     = [bool]$_.alertEnabled
-                                alertOnRemediate = [bool]$_.alertOnRemediate
-                            }
-                        })
+                    conditions      = @($StageDefinition.conditions | Where-Object { $_.type })
+                    # Enumerated explicitly: member access on an empty array yields a lone $null.
+                    standards       = @($StageConfigs | ForEach-Object { $_.instance })
+                    standardsConfig = @($StageConfigs)
                 }
             }
             $Stages = @($Stages)
@@ -136,7 +202,15 @@ function Get-CIPPBaseline {
             # Assignment derives from the delta scopes: unique (scope, scopeId) pairs.
             # scopeId is the stable key (group ID / tenant domain); scopeName is for display.
             $AssignmentScopes = @($Deltas | ForEach-Object {
-                    [PSCustomObject]@{ scope = $_.scope; scopeId = $_.scopeId; scopeName = ($_.scopeName ?? $_.scopeId) }
+                    if ($_.scope -eq 'tenant') {
+                        $Domain = $TenantLookup["$($_.scopeId)"].defaultDomainName ?? $_.scopeId
+                        [PSCustomObject]@{ scope = $_.scope; scopeId = $Domain; scopeName = $Domain }
+                    } else {
+                        # A group keeps its ID through a rename, so its current name wins over the one saved with the baseline
+                        $ScopeId = $_.scopeId
+                        $CurrentName = if ($_.scope -eq 'group') { $Groups.Where({ $_.Id -eq $ScopeId }, 'First')[0].Name }
+                        [PSCustomObject]@{ scope = $_.scope; scopeId = $ScopeId; scopeName = ($CurrentName ?? $_.scopeName ?? $ScopeId) }
+                    }
                 } | Sort-Object -Property scope, scopeId -Unique)
             $AssignedTenants = @($AssignmentScopes | ForEach-Object {
                     if ($_.scope -eq 'allTenants') { 'AllTenants' } else { $_.scopeName }
@@ -148,6 +222,17 @@ function Get-CIPPBaseline {
             try { if ($RolloutRow.assignedTo) { $AssignedTo = @($RolloutRow.assignedTo | ConvertFrom-Json -ErrorAction Stop) } } catch { }
             $ExcludedTo = @()
             try { if ($RolloutRow.excludedTo) { $ExcludedTo = @($RolloutRow.excludedTo | ConvertFrom-Json -ErrorAction Stop) } } catch { }
+            foreach ($Option in @($AssignedTo) + @($ExcludedTo)) {
+                $Tenant = $TenantLookup["$($Option.value)"]
+                if ($Tenant -and $Option.value -ne $Tenant.defaultDomainName) {
+                    $Option.value = $Tenant.defaultDomainName
+                    $Option.label = '{0} ({1})' -f $Tenant.displayName, $Tenant.defaultDomainName
+                }
+                if ($Option.type -eq 'Group') {
+                    $GroupName = $Groups.Where({ $_.Id -eq $Option.value }, 'First')[0].Name
+                    if ($GroupName) { $Option.label = $GroupName }
+                }
+            }
             $Assignments = @($AssignmentScopes | ForEach-Object {
                     if ($_.scope -eq 'allTenants') {
                         [PSCustomObject]@{ value = 'AllTenants'; label = '*All Tenants* (AllTenants)'; type = 'Tenant' }
@@ -182,7 +267,17 @@ function Get-CIPPBaseline {
                 } elseif ("$EnteredStageAt") {
                     [int64]$EnteredStageAt
                 } else { $null }
-                $NextStageDef = if ($CurrentStage -lt $Stages.Count) { $Stages[$CurrentStage] } else { $null }
+                # A tenant outside the group an AND stage requires never reaches that stage or any after it.
+                $TotalStages = $Stages.Count
+                for ($i = 1; $i -lt $Stages.Count -and $TotalStages -eq $Stages.Count; $i++) {
+                    if ($Stages[$i].logic -eq 'or') { continue }
+                    foreach ($Condition in @($Stages[$i].conditions).Where({ $_.type -eq 'group' })) {
+                        $GroupKey = "$($Condition.group.value ?? $Condition.group)"
+                        $Group = $Groups.Where({ $_.Id -eq $GroupKey -or $_.Name -eq $GroupKey }, 'First')[0]
+                        if (@($Group.Members.defaultDomainName) -notcontains $TenantDomain) { $TotalStages = [Math]::Max($i, $CurrentStage) }
+                    }
+                }
+                $NextStageDef = if ($CurrentStage -lt $TotalStages) { $Stages[$CurrentStage] } else { $null }
                 $TimeCondition = $NextStageDef.conditions | Where-Object { $_.type -eq 'time' } | Select-Object -First 1
                 $EstimatedAdvanceAt = if ($TimeCondition -and $EnteredStageAt) {
                     $Multiplier = if ($TimeCondition.unit -eq 'weeks') { 7 } else { 1 }
@@ -190,9 +285,10 @@ function Get-CIPPBaseline {
                 } else { $null }
                 [PSCustomObject]@{
                     tenantFilter       = $TenantDomain
+                    customerId         = $TenantLookup[$TenantDomain].customerId
                     tenantName         = $TenantNames[$TenantDomain] ?? $TenantDomain
                     currentStage       = $CurrentStage
-                    totalStages        = $Stages.Count
+                    totalStages        = $TotalStages
                     stageName          = $Stages[$CurrentStage - 1].name
                     enteredStageAt     = $EnteredStageAt
                     nextStage          = $NextStageDef
@@ -202,11 +298,18 @@ function Get-CIPPBaseline {
                 }
             }
 
-            # Explicit rollout state rows for this baseline.
+            # Explicit rollout state rows for this baseline. 'Exported Template' is the
+            # community-export assignment placeholder - it shows in the editor's tenant
+            # selector so the operator knows to re-assign, but it is never a runnable
+            # tenant: no state, no work items, no resolved rows.
             $StateRows = Get-CIPPAzDataTableEntity @StateTable -Filter "PartitionKey eq '$SafeGuid'"
             $TenantStates = [System.Collections.Generic.List[object]]::new()
-            foreach ($State in $StateRows) {
-                $TenantStates.Add((& $NewState $State.RowKey ([int]($State.currentStage ?? 1)) $State.enteredStageAt))
+            # customerId-keyed rows first: they win over a row an older save keyed by domain.
+            foreach ($State in @($StateRows | Sort-Object -Property { $TenantLookup["$($_.RowKey)"].customerId -ne "$($_.RowKey)" })) {
+                if ("$($State.RowKey)" -eq 'Exported Template') { continue }
+                $Domain = $TenantLookup["$($State.RowKey)"].defaultDomainName ?? "$($State.RowKey)"
+                if ($TenantStates.tenantFilter -contains $Domain) { continue }
+                $TenantStates.Add((& $NewState $Domain ([int]($State.currentStage ?? 1)) $State.enteredStageAt))
             }
 
             # Every assigned tenant without a state row defaults to stage 1 since assignment.
@@ -220,7 +323,7 @@ function Get-CIPPBaseline {
                     $Assignment.scopeId
                 }
             }
-            $AssignedDomains = @($AssignedDomains | Where-Object { $_ -and $ExcludedTenants -notcontains $_ } | Select-Object -Unique)
+            $AssignedDomains = @($AssignedDomains | Where-Object { $_ -and $_ -ne 'Exported Template' -and $ExpandedExcludedTenants -notcontains $_ } | Select-Object -Unique)
             foreach ($Domain in $AssignedDomains) {
                 if ($TenantStates.tenantFilter -notcontains $Domain) {
                     $TenantStates.Add((& $NewState $Domain 1 $RolloutRow.updatedAt))
@@ -243,17 +346,27 @@ function Get-CIPPBaseline {
                 }
             }
 
+            $IsRepoSource = Test-CIPPRepoSource -Source $RolloutRow.Source
             [PSCustomObject]@{
                 GUID               = $GUID
                 templateName       = $RolloutRow.templateName
                 baselineName       = $RolloutRow.templateName
                 description        = $RolloutRow.description
                 assignedTenants    = $AssignedTenants
-                assignments        = $(if ($AssignedTo.Count -gt 0) { $AssignedTo } else { $Assignments })
-                exclusions         = $(if ($ExcludedTo.Count -gt 0) { $ExcludedTo } else { @($ExcludedTenants | ForEach-Object { [PSCustomObject]@{ label = $_; value = $_ } }) })
-                excludedTenants    = $ExcludedTenants
+                # @() not $(): a subexpression unrolls a one-item list into a bare object, which
+                # the table then flattens into "Exclusions - Label" columns that go blank as soon
+                # as a second entry exists (#771). Always ship a real array.
+                assignments        = @(if ($AssignedTo.Count -gt 0) { $AssignedTo } else { $Assignments })
+                exclusions         = @(if ($ExcludedTo.Count -gt 0) { $ExcludedTo } else { $ExcludedTenants | ForEach-Object { [PSCustomObject]@{ label = $_; value = $_ } } })
+                excludedTenants    = $ExpandedExcludedTenants
                 alertEmails        = $RolloutRow.alertEmails
                 alertWebhookUrl    = $RolloutRow.alertWebhookUrl
+                disableAlerts      = [bool]$RolloutRow.disableAlerts
+                disableScheduledRuns = [bool]$RolloutRow.disableScheduledRuns
+                source             = $(if ($IsRepoSource) { $RolloutRow.Source } else { $null })
+                isSynced           = ($IsRepoSource -and ![string]::IsNullOrEmpty($RolloutRow.SHA))
+                sourceUrl          = $(if ($IsRepoSource) { Get-CIPPTemplateSourceUrl -Source $RolloutRow.Source -SourcePath $RolloutRow.SourcePath -Repos $Repos } else { $null })
+                hasLocalChanges    = $(if ($IsRepoSource) { [bool]$RolloutRow.LocalChanges } else { $null })
                 standardsCount     = $UniqueStandards.Count
                 stageNames         = @($Stages.name)
                 stages             = $Stages

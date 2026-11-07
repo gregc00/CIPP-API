@@ -106,7 +106,10 @@ BeforeAll {
         }
     }
 
+    function Get-CIPPTenantLookup { @{} }
+
     . $FunctionPath
+    . (Join-Path $RepoRoot 'Modules/CIPPCore/Public/Get-CIPPTenantDriftState.ps1')
 }
 
 Describe 'Get-CIPPDrift - Intune extra-policy matching (#6347 and Settings Catalog regression)' {
@@ -529,6 +532,47 @@ Describe 'Get-CIPPDrift - stale drift entity pruning' {
         $script:RemovedDriftEntities.Count | Should -Be 0
     }
 
+    It 'does not remove a decided IntuneTemplates row when a continuation page of the policy inventory failed' {
+        # New-GraphBulkRequest keeps status 200 on an item whose later page failed and flags it
+        # PagingIncomplete instead. Policies on the missing page are absent from the inventory, so
+        # without this gate their accepted rows were pruned as "gone" and re-created as New on the
+        # next run (the reported reset of customer-specific deviations every couple of days).
+        $script:DriftEntityRows = @(New-DriftEntity -StandardName 'IntuneTemplates.policy-on-page-two' -Status 'CustomerSpecific' -Reason 'customer specific' -User 'admin@msp.com')
+        Mock -CommandName Test-CIPPStandardLicense -MockWith { param($StandardName, $TenantFilter, $Preset) $Preset -eq 'Intune' }
+        Mock -CommandName New-GraphBulkRequest -MockWith {
+            param($Requests, $tenantid, $asapp)
+            foreach ($r in $Requests) {
+                $Item = [pscustomobject]@{ id = $r.id; status = 200; body = @{ value = @() } }
+                if ($r.id -eq 'deviceManagement/configurationPolicies') {
+                    $Item | Add-Member -NotePropertyName 'PagingIncomplete' -NotePropertyValue $true
+                    $Item | Add-Member -NotePropertyName 'PagingError' -NotePropertyValue 'continuation page returned 429'
+                }
+                $Item
+            }
+        }
+
+        Get-CIPPDrift -TenantFilter 'contoso.onmicrosoft.com' -WarningVariable Warnings -WarningAction SilentlyContinue | Out-Null
+
+        $script:RemovedDriftEntities.Count | Should -Be 0
+        @($Warnings) | Where-Object { $_ -match 'incomplete' -and $_ -match '429' } | Should -Not -BeNullOrEmpty
+    }
+
+    It 'still prunes a vanished IntuneTemplates row when every page of the inventory succeeded' {
+        # Control for the test above: same rows, same inventory, no incomplete flag - the row has no
+        # matching tenant policy and is correctly removed.
+        $script:DriftEntityRows = @(New-DriftEntity -StandardName 'IntuneTemplates.policy-really-gone' -Status 'CustomerSpecific' -Reason 'customer specific' -User 'admin@msp.com')
+        Mock -CommandName Test-CIPPStandardLicense -MockWith { param($StandardName, $TenantFilter, $Preset) $Preset -eq 'Intune' }
+        Mock -CommandName New-GraphBulkRequest -MockWith {
+            param($Requests, $tenantid, $asapp)
+            foreach ($r in $Requests) { [pscustomobject]@{ id = $r.id; status = 200; body = @{ value = @() } } }
+        }
+
+        Get-CIPPDrift -TenantFilter 'contoso.onmicrosoft.com' | Out-Null
+
+        $script:RemovedDriftEntities.Count | Should -Be 1
+        $script:RemovedDriftEntities[0].StandardName | Should -Be 'IntuneTemplates.policy-really-gone'
+    }
+
     It 'does not remove a drift row that is still referenced by the current alignment' {
         $script:DriftEntityRows = @(New-DriftEntity -StandardName 'standards.StillRelevant')
         Mock -CommandName Get-CIPPTenantAlignment -MockWith {
@@ -707,5 +751,94 @@ Describe 'Get-CIPPDrift - stale drift entity pruning' {
         Get-CIPPDrift -TenantFilter 'contoso.onmicrosoft.com' -TemplateId 'drift-template-1' | Out-Null
 
         $script:RemovedDriftEntities.Count | Should -Be 0
+    }
+}
+
+Describe 'Get-CIPPDrift - decisions saved under an older default domain' {
+    BeforeEach {
+        $script:IntuneTemplateRows = @()
+        $script:CATemplateRows = @()
+        $script:ReusableTemplateRows = @()
+        $script:AddedDriftEntities = [System.Collections.Generic.List[object]]::new()
+        $script:RemovedDriftEntities = [System.Collections.Generic.List[object]]::new()
+        $script:DriftEntityRows = @(
+            [pscustomobject]@{ PartitionKey = 'contoso.onmicrosoft.com'; RowKey = 'standards_EnableOnlineArchiving'; StandardName = 'standards.EnableOnlineArchiving'; Status = 'DeniedRemediate'; Reason = 'keep archives on'; User = 'tech@contoso.com'; Timestamp = (Get-Date).AddDays(-150) }
+            [pscustomobject]@{ PartitionKey = 'contoso.com'; RowKey = 'standards_EnableOnlineArchiving'; StandardName = 'standards.EnableOnlineArchiving'; Status = 'New'; Timestamp = (Get-Date).AddDays(-90) }
+        )
+        $Tenant = [pscustomobject]@{ customerId = 'cid-1'; defaultDomainName = 'contoso.com'; initialDomainName = 'contoso.onmicrosoft.com' }
+        $script:Lookup = @{ 'cid-1' = $Tenant; 'contoso.com' = $Tenant; 'contoso.onmicrosoft.com' = $Tenant }
+
+        Mock -CommandName Get-CIPPTenantLookup -MockWith { $script:Lookup }
+        Mock -CommandName Test-CIPPStandardLicense -MockWith { $false }
+        Mock -CommandName Get-CippTable -MockWith { param($tablename) @{ TableName = $tablename } }
+        Mock -CommandName New-GraphBulkRequest -MockWith { @() }
+        Mock -CommandName Get-CIPPAzDataTableEntity -MockWith {
+            param($Filter, $TableName)
+            switch -Wildcard ($Filter) {
+                "*PartitionKey eq 'IntuneTemplate'*" { return @($script:IntuneTemplateRows) }
+                "*PartitionKey eq 'CATemplate'*" { return @($script:CATemplateRows) }
+                "*PartitionKey eq 'IntuneReusableSettingTemplate'*" { return @($script:ReusableTemplateRows) }
+                default { return @($script:DriftEntityRows | Where-Object { $Filter -like "*PartitionKey eq '$($_.PartitionKey)'*" }) }
+            }
+        }
+        Mock -CommandName Add-CIPPAzDataTableEntity -MockWith {
+            param($Entity, [switch]$Force, $TableName)
+            foreach ($e in @($Entity)) { $script:AddedDriftEntities.Add($e) }
+        }
+        Mock -CommandName Remove-CIPPAzDataTableEntity -MockWith {
+            param($Entity, $TableName)
+            $script:RemovedDriftEntities.Add($Entity)
+        }
+        Mock -CommandName Get-CIPPTenantAlignment -MockWith {
+            @([pscustomobject]@{
+                    standardType         = 'drift'
+                    StandardName         = 'Standard'
+                    StandardId           = 'sid-7'
+                    AlignmentScore       = 90
+                    CompliantStandards   = 1
+                    LatestDataCollection = (Get-Date)
+                    ComparisonDetails    = @(
+                        [pscustomobject]@{ StandardName = 'standards.EnableOnlineArchiving'; Compliant = $false; StandardValue = $true; ComplianceStatus = 'Non-Compliant' }
+                        [pscustomobject]@{ StandardName = 'standards.DisableSMS'; Compliant = $false; StandardValue = $true; ComplianceStatus = 'Non-Compliant' }
+                    )
+                })
+        }
+    }
+
+    It 'keeps a decision made before the default domain changed instead of raising it as new drift' {
+        $Result = Get-CIPPDrift -TenantFilter 'contoso.com'
+
+        $Archive = @($Result[0].currentDeviations + $Result[0].deniedDeviations) | Where-Object standardName -EQ 'standards.EnableOnlineArchiving' | Select-Object -First 1
+        $Archive.Status | Should -Be 'DeniedRemediate'
+        $Result[0].newDeviationsCount | Should -Be 1
+        $Result[0].deniedDeviationsCount | Should -Be 1
+    }
+
+    It 'moves the decision to the customerId partition and removes the domain-keyed rows' {
+        Get-CIPPDrift -TenantFilter 'contoso.com' | Out-Null
+
+        $Moved = @($script:AddedDriftEntities | Where-Object { $_.StandardName -eq 'standards.EnableOnlineArchiving' })
+        $Moved.Count | Should -Be 1
+        $Moved[0].PartitionKey | Should -Be 'cid-1'
+        $Moved[0].Status | Should -Be 'DeniedRemediate'
+        $Moved[0].Reason | Should -Be 'keep archives on'
+        @($script:RemovedDriftEntities.PartitionKey | Sort-Object) | Should -Be @('contoso.com', 'contoso.onmicrosoft.com')
+    }
+
+    It 'writes a newly detected deviation under the customerId' {
+        Get-CIPPDrift -TenantFilter 'contoso.com' | Out-Null
+
+        $New = @($script:AddedDriftEntities | Where-Object { $_.StandardName -eq 'standards.DisableSMS' })
+        $New.Count | Should -Be 1
+        $New[0].PartitionKey | Should -Be 'cid-1'
+        $New[0].Status | Should -Be 'New'
+    }
+
+    It 'prefers the customerId decision over an older domain-keyed one' {
+        $script:DriftEntityRows = @(
+            [pscustomobject]@{ PartitionKey = 'contoso.onmicrosoft.com'; StandardName = 'standards.EnableOnlineArchiving'; Status = 'DeniedRemediate'; Timestamp = (Get-Date).AddDays(-150) }
+            [pscustomobject]@{ PartitionKey = 'cid-1'; StandardName = 'standards.EnableOnlineArchiving'; Status = 'Accepted'; Timestamp = (Get-Date).AddDays(-200) }
+        )
+        (Get-CIPPTenantDriftState -TenantFilter 'contoso.com').States['standards.EnableOnlineArchiving'].Status | Should -Be 'Accepted'
     }
 }

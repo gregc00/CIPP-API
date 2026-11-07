@@ -21,10 +21,6 @@
   "appliesToTest": [
     "CIS_5_1_6_2",
     "EIDSCAAP07",
-    "EIDSCAAP14",
-    "EIDSCAST08",
-    "EIDSCAST09",
-    "SMB1001_2_8",
     "ZTNA21792"
   ],
   "recommendedBy": [
@@ -61,11 +57,16 @@
   "read": {
     "cacheType": "AuthorizationPolicy"
   },
+  "writeTarget": "authorizationPolicy",
+  "writeTargetProperties": {
+    "guestUserRoleId": "%guestUserRoleId%"
+  },
   "remediate": {
     "executor": "GraphRequest",
     "requests": [
       {
         "method": "PATCH",
+        "asApp": false,
         "uri": "policies/authorizationPolicy/authorizationPolicy",
         "body": {
           "guestUserRoleId": "%guestUserRoleId%"

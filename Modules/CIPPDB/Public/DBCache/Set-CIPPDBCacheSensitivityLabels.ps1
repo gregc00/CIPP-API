@@ -21,6 +21,9 @@ function Set-CIPPDBCacheSensitivityLabels {
 
         if ($LicenseCheck -eq $false) {
             Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message 'Tenant does not have a Purview/AIP license, skipping sensitivity labels' -sev Debug
+            # A license skip is still a completed collection: record the authoritative empty set
+            # so collect-on-miss does not re-run this collector forever on unlicensed tenants.
+            Add-CIPPDbItem -TenantFilter $TenantFilter -Type 'SensitivityLabels' -Data @() -AddCount -ClearOnEmpty
             return
         }
 
@@ -31,9 +34,19 @@ function Set-CIPPDBCacheSensitivityLabels {
         if ($Labels) {
             Add-CIPPDbItem -TenantFilter $TenantFilter -Type 'SensitivityLabels' -Data $Labels -AddCount
             Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message "Cached $($Labels.Count) sensitivity labels" -sev Debug
+        } else {
+            # The read succeeded with nothing returned: write the authoritative empty set so the
+            # Count marker records a completed collection and stale rows are cleared.
+            Add-CIPPDbItem -TenantFilter $TenantFilter -Type 'SensitivityLabels' -Data @() -AddCount -ClearOnEmpty
+            Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message 'Cached 0 sensitivity labels (none found)' -sev Debug
         }
 
     } catch {
+        # Graph answers 404 for a tenant that has never published a label
+        if ($_.Exception.Message -like '*could not be found*') {
+            Add-CIPPDbItem -TenantFilter $TenantFilter -Type 'SensitivityLabels' -Data @() -AddCount -ClearOnEmpty
+            return
+        }
         $ErrorMessage = Get-CippException -Exception $_
         Write-LogMessage -API 'CIPPDBCache' -tenant $TenantFilter -message "Failed to cache sensitivity labels: $($ErrorMessage.NormalizedError)" -sev Warning -LogData $ErrorMessage
     }

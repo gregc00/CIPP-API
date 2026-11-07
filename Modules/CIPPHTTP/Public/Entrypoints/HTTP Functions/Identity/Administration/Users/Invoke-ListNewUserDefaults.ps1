@@ -31,13 +31,21 @@ function Invoke-ListNewUserDefaults {
         try {
             $row = $_
             $data = $row.JSON | ConvertFrom-Json -Depth 100 -ErrorAction Stop
-            $data | Add-Member -NotePropertyName 'GUID' -NotePropertyValue $row.GUID -Force
-            $data | Add-Member -NotePropertyName 'RowKey' -NotePropertyValue $row.RowKey -Force
+            $data | Add-Member -NotePropertyMembers ([ordered]@{
+                    GUID   = $row.GUID
+                    RowKey = $row.RowKey
+                }) -Force
             $data
         } catch {
             Write-Warning "Failed to process User Default template: $($row.RowKey) - $($_.Exception.Message)"
         }
     }
+
+    # Templates for all tenants stay visible to everyone; a tenant's own templates only to callers with that tenant.
+    $Templates = @(
+        @($Templates).Where({ $_.tenantFilter -eq 'AllTenants' })
+        @($Templates).Where({ $_.tenantFilter -ne 'AllTenants' }) | Select-CippAllowedTenantData -TenantProperty 'tenantFilter'
+    )
 
     # Filter by tenant if TenantFilter is provided
     if ($TenantFilter) {

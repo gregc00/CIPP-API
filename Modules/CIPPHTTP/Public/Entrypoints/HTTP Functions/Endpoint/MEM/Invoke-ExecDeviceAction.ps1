@@ -38,6 +38,21 @@ function Invoke-ExecDeviceAction {
                 Write-Host "ActionBody: $ActionBody"
                 break
             }
+            'wipe' {
+                # Graph rejects/ignores unknown wipe parameters and an empty macOsUnlockCode,
+                # so forward only the supported ones instead of the raw request body
+                $WipeBody = @{}
+                foreach ($Param in @('keepUserData', 'keepEnrollmentData', 'useProtectedWipe', 'persistEsimDataPlan')) {
+                    if ($null -ne $Request.Body.$Param) {
+                        $WipeBody[$Param] = [System.Convert]::ToBoolean("$($Request.Body.$Param)")
+                    }
+                }
+                if (-not [string]::IsNullOrWhiteSpace($Request.Body.macOsUnlockCode)) {
+                    $WipeBody.macOsUnlockCode = "$($Request.Body.macOsUnlockCode)"
+                }
+                $ActionBody = $WipeBody | ConvertTo-Json -Compress
+                break
+            }
             'createDeviceLogCollectionRequest' {
                 $ActionBody = @{
                     templateType = @{
@@ -45,6 +60,15 @@ function Invoke-ExecDeviceAction {
                         templateType  = 'predefined'
                     }
                 } | ConvertTo-Json -Compress -Depth 5
+                break
+            }
+            'initiateOnDemandProactiveRemediation' {
+                # Graph takes only the remediation script id, not the rest of the request body
+                $ScriptPolicyId = $Request.Body.scriptPolicyId.value ?? $Request.Body.scriptPolicyId
+                if ([string]::IsNullOrWhiteSpace($ScriptPolicyId)) {
+                    throw 'Select a remediation script to run.'
+                }
+                $ActionBody = @{ scriptPolicyId = "$ScriptPolicyId" } | ConvertTo-Json -Compress
                 break
             }
             default { $ActionBody = $Request.Body | ConvertTo-Json -Compress }

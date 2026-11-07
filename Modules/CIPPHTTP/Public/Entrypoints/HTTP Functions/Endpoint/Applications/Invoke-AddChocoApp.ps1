@@ -36,6 +36,10 @@ function Invoke-AddChocoApp {
     $intuneBody = Get-Content -LiteralPath $AppTemplatePath -Raw | ConvertFrom-Json
     $AssignTo = $Request.Body.AssignTo -eq 'customGroup' ? $Request.Body.CustomGroup : $Request.Body.AssignTo
     $ExcludeGroup = $Request.Body.excludeGroup
+    # Group ids from the deploy drawer's single-tenant picker. CustomGroup/excludeGroup still
+    # carry the display names for logging and as a fallback if the ids are ever dropped.
+    $GroupIds = @($Request.Body.GroupIds | Where-Object { $_ })
+    $ExcludeGroupIds = @($Request.Body.ExcludeGroupIds | Where-Object { $_ })
     $intuneBody.description = $ChocoApp.description
     $intuneBody.displayName = $ChocoApp.ApplicationName
     $intuneBody.installExperience.runAsAccount = if ($ChocoApp.InstallAsSystem) { 'system' } else { 'user' }
@@ -54,8 +58,7 @@ function Invoke-AddChocoApp {
     $intuneBody.detectionRules[0].path = "$($ENV:SystemDrive)\programdata\chocolatey\lib"
     $intuneBody.detectionRules[0].fileOrFolderName = $PackageName
 
-    $AllowedTenants = Test-CIPPAccess -Request $Request -TenantList
-    $Tenants = ($Request.Body.selectedTenants | Where-Object { $AllowedTenants -contains $_.customerId -or $AllowedTenants -contains 'AllTenants' }).defaultDomainName
+    $Tenants = (Resolve-CippBulkSelectedTenant -Request $Request -SelectedTenants $Request.Body.selectedTenants).defaultDomainName
 
     $Results = foreach ($Tenant in $Tenants) {
         try {
@@ -70,6 +73,8 @@ function Invoke-AddChocoApp {
                 ApplicationName    = $ChocoApp.ApplicationName
                 assignTo           = $AssignTo
                 excludeGroup       = $ExcludeGroup
+                GroupIds           = $GroupIds
+                ExcludeGroupIds    = $ExcludeGroupIds
                 InstallationIntent = $Request.Body.InstallationIntent
                 IntuneBody         = $TenantIntuneBody
             } | ConvertTo-Json -Depth 15
